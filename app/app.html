@@ -764,16 +764,58 @@
               <input type="button" id="lockButtonSubmit" value="Set as Lock Button" />
             </form>
             <form>
-              <b class="config-mode-required">Derived Key User Input Mode</b><a
+              <b class="config-mode-required">Derived Key Options</b><a
                 href="https://docs.crp.to/usersguide.html#challenge-mode"
                 class="external tooltip fade"
-                data-tooltip="By default, you must enter a 3-digit Challenge Code on OnlyKey to perform SSH or PGP operations. Changing this option to 'Button Press' allows those operations by tapping any button on your OnlyKey."
+                data-tooltip="These options are stored together in one setting on the OnlyKey, so they are saved together. Whatever is shown here when you press Save becomes the setting."
               ><img class="moveimage" src="/images/solid/question-circle.svg" /></a>
               <br />
-              Enable or disable challenge for derived keys (SSH/PGP)
+              <em
+                >These are saved together as one setting - set them all, then
+                press Save.</em
+              >
+              <br /><br />
+
+              <u>Confirmation for SSH/GPG derived keys</u>
               <br />
-              <input type="button" id="derivedKeyChallengeCodeBtn" value="Challenge Code" />
-              <input type="button" id="derivedKeyBtnPressBtn" value="Button Press" />
+              <label
+                ><input
+                  type="radio"
+                  name="derivedKeyInput"
+                  id="derivedKeyChallengeCode"
+                  value="0"
+                  checked
+                />
+                Challenge Code (enter 3 digits)</label
+              >
+              <label
+                ><input type="radio" name="derivedKeyInput" id="derivedKeyBtnPress" value="1" />
+                Button Press (tap any button)</label
+              >
+              <br /><br />
+
+              <u>Web browser access</u>
+              <br />
+              <label
+                ><input type="checkbox" id="derivedKeyDisableWeb" />
+                Block all browser access to this OnlyKey</label
+              >
+              <a
+                class="tooltip fade"
+                data-tooltip="Turns off the OnlyKey browser extension completely, including derived keys used by the web app's password generator, vault and age encryption."
+              ><img class="moveimage" src="/images/solid/question-circle.svg" /></a>
+              <br />
+              <label
+                ><input type="checkbox" id="derivedKeyAllowWebPgp" />
+                Allow web pages to use my stored keys (PGP)</label
+              >
+              <a
+                class="tooltip fade"
+                data-tooltip="Off by default. When off, web pages can only use derived keys, which are label-scoped and reproducible. Turn this on only if you use PGP in the OnlyKey web app."
+              ><img class="moveimage" src="/images/solid/question-circle.svg" /></a>
+              <br /><br />
+
+              <input type="button" id="derivedKeyOptionsSaveBtn" value="Save Derived Key Options" />
               <br />
             </form>
             <form>
