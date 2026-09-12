@@ -2470,25 +2470,32 @@ function submitstoredchallengeMode(e, storedchallengeMode) {
   return myOnlyKey.setstoredchallengeMode(storedchallengeMode);
 }
 
-// Field 21 is a BITFIELD, not an enum, and this used to write the whole byte as
-// 0 or 1 from two buttons - so choosing "Button Press" silently cleared every
-// other bit in it, and setting any other bit silently reverted the input mode.
-// The form composes the whole byte instead, which is also why the UI says the
-// options are saved together.
+// Field 21 carries an ENUM in the low nibble and FLAGS in the high nibble:
 //
-//   bit 0 (1)   SSH/GPG derived keys: 1 = button press, 0 = 3-digit challenge
-//   bit 1 (2)   disable the browser extension entirely
-//   bit 4 (16)  allow stored-slot sign/decrypt over FIDO2 (PGP in a browser)
+//   value & 0x0F   user input mode: 0 = challenge code, 1 = button press,
+//                  2 = none
+//   0x10  bit 4    allow stored-slot sign/decrypt over FIDO2 (PGP in a browser)
+//   0x20  bit 5    disable the browser extension entirely
+//   0x40, 0x80     reserved
 //
-// Bits 2 and 3 were removed in firmware and are not written here. Bits 5-7 are
-// unused. The firmware accepts this write only in config mode.
+// This used to write the whole byte as 0 or 1 from two buttons, so each setting
+// silently cleared the others. The form composes the whole byte instead, which
+// is why the UI says the options save together.
+//
+// The kill switch is bit 5 and not bit 1 because bit 1 IS enum value 2 - a key
+// set to "no confirmation" would otherwise read as "extension disabled" and
+// vice versa, and that second direction fails open. Bits 2 and 3 were removed
+// from the firmware and are never written. The firmware accepts this write only
+// in config mode.
 function submitderivedchallengeMode(e) {
   e && e.preventDefault && e.preventDefault();
 
   var mode = 0;
-  if (document.getElementById("derivedKeyBtnPress").checked) mode |= 1;
-  if (document.getElementById("derivedKeyDisableWeb").checked) mode |= 2;
-  if (document.getElementById("derivedKeyAllowWebPgp").checked) mode |= 16;
+  if (document.getElementById("derivedKeyBtnPress").checked) mode = 1;
+  else if (document.getElementById("derivedKeyNoInput").checked) mode = 2;
+
+  if (document.getElementById("derivedKeyAllowWebPgp").checked) mode |= 0x10;
+  if (document.getElementById("derivedKeyDisableWeb").checked) mode |= 0x20;
 
   return myOnlyKey.setderivedchallengeMode(mode);
 }
