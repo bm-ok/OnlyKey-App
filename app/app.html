@@ -812,10 +812,10 @@
               >
               <br /><br />
 
-              <u>Webcrypt derived keys</u>
+              <u>Web-derivation slot keys (Webcrypt and local agents)</u>
               <a
                 class="tooltip fade"
-                data-tooltip="Used by the OnlyKey web app for age encryption and other label-derived keys. This setting never changes which key is derived - only how you authorise it - so anything already encrypted to a label still decrypts."
+                data-tooltip="Covers every use of the web-derivation slot, not just the browser: the OnlyKey web app AND local tools over USB (python-onlykey, onlykey-agent, age). This setting never changes which key is derived - only how you authorise it - so anything already encrypted to a label still decrypts."
               ><img class="moveimage" src="/images/solid/question-circle.svg" /></a>
               <br />
               <label
@@ -838,7 +838,7 @@
               >
               <a
                 class="tooltip fade"
-                data-tooltip="No confirmation at all for web derived keys - intended for an unattended agent using an SSH key from the derivation slot. While this is set, the OnlyKey web app can derive and decrypt silently whenever the key is unlocked. Off by default; leave it off unless you are running an agent that needs it."
+                data-tooltip="No confirmation at all for the web-derivation slot - intended for an unattended agent using an SSH key from that slot. This applies over USB AND to the OnlyKey web app: while it is set, either can derive and decrypt silently whenever the key is unlocked. Off by default; leave it off unless you are running an agent that needs it."
               ><img class="moveimage" src="/images/solid/question-circle.svg" /></a>
               <br /><br />
 
