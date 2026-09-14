@@ -812,33 +812,33 @@
               >
               <br /><br />
 
-              <u>Web-derivation slot keys (Webcrypt and local agents)</u>
+              <u>Web and agent derived keys</u>
               <a
                 class="tooltip fade"
-                data-tooltip="Covers every use of the web-derivation slot, not just the browser: the OnlyKey web app AND local tools over USB (python-onlykey, onlykey-agent, age). This setting never changes which key is derived - only how you authorise it - so anything already encrypted to a label still decrypts."
+                data-tooltip="Keys derived on demand from a label, shared by the OnlyKey web app and by local agents over USB (onlykey-agent, python-onlykey, age). This is the accessible tier: easier to reach than a stored key, and correspondingly less protected. The setting never changes WHICH key is derived, only how you authorise it, so anything already encrypted to a label still decrypts."
               ><img class="moveimage" src="/images/solid/question-circle.svg" /></a>
               <br />
               <label
-                ><input type="radio" name="webDeriveInput" id="webDeriveChallengeCode" value="0" />
+                ><input type="radio" name="webAgentDeriveInput" id="webAgentDeriveChallengeCode" value="0" />
                 Challenge Code (enter 3 digits)</label
               >
               <label
                 ><input
                   type="radio"
-                  name="webDeriveInput"
-                  id="webDeriveBtnPress"
+                  name="webAgentDeriveInput"
+                  id="webAgentDeriveBtnPress"
                   value="1"
                   checked
                 />
                 Button Press (tap any button)</label
               >
               <label
-                ><input type="radio" name="webDeriveInput" id="webDeriveNoInput" value="2" />
+                ><input type="radio" name="webAgentDeriveInput" id="webAgentDeriveNoInput" value="2" />
                 None (no confirmation) - for unattended agents</label
               >
               <a
                 class="tooltip fade"
-                data-tooltip="No confirmation at all for the web-derivation slot - intended for an unattended agent using an SSH key from that slot. This applies over USB AND to the OnlyKey web app: while it is set, either can derive and decrypt silently whenever the key is unlocked. Off by default; leave it off unless you are running an agent that needs it."
+                data-tooltip="No confirmation at all - intended for an unattended agent using an SSH key from this slot. Applies over USB AND to the OnlyKey web app: while it is set, either can derive and decrypt silently whenever the key is unlocked. Off by default; leave it off unless you are running an agent that needs it."
               ><img class="moveimage" src="/images/solid/question-circle.svg" /></a>
               <br /><br />
 

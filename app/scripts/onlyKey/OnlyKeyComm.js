@@ -221,7 +221,7 @@ function OnlyKey(params = {}) {
     BACKUPKEYMODE: 20,
     derivedchallengeMode: 21,
     storedchallengeMode: 22,
-    webDeriveMode: 30,
+    webAgentDeriveMode: 30,
     webcryptPolicy: 31,
     SECPROFILEMODE: 23,
     TYPESPEED: 13,
@@ -944,9 +944,9 @@ OnlyKey.prototype.setstoredchallengeMode = function (storedchallengeMode) {
   });
 };
 
-OnlyKey.prototype.setwebDeriveMode = function (webDeriveMode) {
-  this.setSlot("XX", "webDeriveMode", webDeriveMode, async () => {
-    return await this.listenforvalue("web derived key mode");
+OnlyKey.prototype.setwebAgentDeriveMode = function (webAgentDeriveMode) {
+  this.setSlot("XX", "webAgentDeriveMode", webAgentDeriveMode, async () => {
+    return await this.listenforvalue("web and agent derived key mode");
   });
 };
 
@@ -2526,7 +2526,7 @@ function submitUserInputModes(e) {
   e && e.preventDefault && e.preventDefault();
   myOnlyKey.setderivedchallengeMode(selectedRadioValue("derivedKeyInput", 0));
   myOnlyKey.setstoredchallengeMode(selectedRadioValue("storedKeyInput", 0));
-  return myOnlyKey.setwebDeriveMode(selectedRadioValue("webDeriveInput", 1));
+  return myOnlyKey.setwebAgentDeriveMode(selectedRadioValue("webAgentDeriveInput", 1));
 }
 
 function submitWebcryptPolicy(e) {
