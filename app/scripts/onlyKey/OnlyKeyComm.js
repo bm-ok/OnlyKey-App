@@ -2473,7 +2473,7 @@ function submitstoredchallengeMode(e, storedchallengeMode) {
 // Field 21 carries an ENUM in the low nibble and FLAGS in the high nibble:
 //
 //   value & 0x0F   user input mode: 0 = challenge code, 1 = button press,
-//                  2 = none
+//                  2 = RESERVED (legacy "disable extension"), 3 = none
 //   0x10  bit 4    allow stored-slot sign/decrypt over FIDO2 (PGP in a browser)
 //   0x20  bit 5    disable the browser extension entirely
 //   0x40, 0x80     reserved
@@ -2482,9 +2482,11 @@ function submitstoredchallengeMode(e, storedchallengeMode) {
 // silently cleared the others. The form composes the whole byte instead, which
 // is why the UI says the options save together.
 //
-// The kill switch is bit 5 and not bit 1 because bit 1 IS enum value 2 - a key
-// set to "no confirmation" would otherwise read as "extension disabled" and
-// vice versa, and that second direction fails open. Bits 2 and 3 were removed
+// The kill switch is bit 5 and not bit 1, and "none" is 3 and not 2, because a
+// legacy byte of 2 meant "extension disabled": reusing that value for "no
+// confirmation required" would flip every key configured that way from the most
+// restrictive state to the least. The firmware translates 2 back to its old
+// meaning and fails closed on anything it does not recognise. Bits 2 and 3 were removed
 // from the firmware and are never written. The firmware accepts this write only
 // in config mode.
 function submitderivedchallengeMode(e) {
@@ -2492,7 +2494,7 @@ function submitderivedchallengeMode(e) {
 
   var mode = 0;
   if (document.getElementById("derivedKeyBtnPress").checked) mode = 1;
-  else if (document.getElementById("derivedKeyNoInput").checked) mode = 2;
+  else if (document.getElementById("derivedKeyNoInput").checked) mode = 3;
 
   if (document.getElementById("derivedKeyAllowWebPgp").checked) mode |= 0x10;
   if (document.getElementById("derivedKeyDisableWeb").checked) mode |= 0x20;
