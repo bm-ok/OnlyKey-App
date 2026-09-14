@@ -764,19 +764,19 @@
               <input type="button" id="lockButtonSubmit" value="Set as Lock Button" />
             </form>
             <form>
-              <b class="config-mode-required">Derived Key Options</b><a
+              <b class="config-mode-required">User Input Modes</b><a
                 href="https://docs.crp.to/usersguide.html#challenge-mode"
                 class="external tooltip fade"
-                data-tooltip="These options are stored together in one setting on the OnlyKey, so they are saved together. Whatever is shown here when you press Save becomes the setting."
+                data-tooltip="How you confirm an operation on the OnlyKey itself. Each key family has its own setting; they are saved together when you press Save but stored separately on the device."
               ><img class="moveimage" src="/images/solid/question-circle.svg" /></a>
               <br />
               <em
-                >These are saved together as one setting - set them all, then
-                press Save.</em
+                >How you confirm an operation on the device. Each family is its
+                own setting.</em
               >
               <br /><br />
 
-              <u>Confirmation for SSH/GPG derived keys</u>
+              <u>SSH/GPG derived keys</u>
               <br />
               <label
                 ><input
@@ -792,47 +792,89 @@
                 ><input type="radio" name="derivedKeyInput" id="derivedKeyBtnPress" value="1" />
                 Button Press (tap any button)</label
               >
+              <br /><br />
+
+              <u>Stored keys (PGP, SSH, RSA and ECC slots)</u>
+              <br />
               <label
-                ><input type="radio" name="derivedKeyInput" id="derivedKeyNoInput" value="3" />
-                None (no confirmation)</label
+                ><input
+                  type="radio"
+                  name="storedKeyInput"
+                  id="storedKeyChallengeCode"
+                  value="0"
+                  checked
+                />
+                Challenge Code (enter 3 digits)</label
+              >
+              <label
+                ><input type="radio" name="storedKeyInput" id="storedKeyBtnPress" value="1" />
+                Button Press (tap any button)</label
               >
               <br /><br />
 
-              <u>Web browser access</u>
-              <br />
-              <label
-                ><input type="checkbox" id="derivedKeyDisableWeb" />
-                Block all browser access to this OnlyKey</label
-              >
+              <u>Web browser derived keys</u>
               <a
                 class="tooltip fade"
-                data-tooltip="Turns off the OnlyKey browser extension completely, including derived keys used by the web app's password generator, vault and age encryption."
+                data-tooltip="Used by the OnlyKey web app for age encryption and other label-derived keys. This setting never changes which key is derived - only how you authorise it - so anything already encrypted to a label still decrypts."
               ><img class="moveimage" src="/images/solid/question-circle.svg" /></a>
               <br />
               <label
-                ><input type="checkbox" id="derivedKeyAllowWebPgp" />
+                ><input type="radio" name="webDeriveInput" id="webDeriveChallengeCode" value="0" />
+                Challenge Code (enter 3 digits)</label
+              >
+              <label
+                ><input
+                  type="radio"
+                  name="webDeriveInput"
+                  id="webDeriveBtnPress"
+                  value="1"
+                  checked
+                />
+                Button Press (tap any button)</label
+              >
+              <label
+                ><input type="radio" name="webDeriveInput" id="webDeriveNoInput" value="2" />
+                None - public keys only</label
+              >
+              <a
+                class="tooltip fade"
+                data-tooltip="Lets a trusted web page look up a derived PUBLIC key without a tap. Decrypting still requires a button press: the OnlyKey enforces that itself and this setting cannot turn it off."
+              ><img class="moveimage" src="/images/solid/question-circle.svg" /></a>
+              <br /><br />
+
+              <input type="button" id="userInputModesSaveBtn" value="Save User Input Modes" />
+              <br />
+            </form>
+            <form>
+              <b class="config-mode-required">Web Browser Access</b><a
+                href="https://docs.crp.to/webcrypt.html"
+                class="external tooltip fade"
+                data-tooltip="What web pages are allowed to do with this OnlyKey. Separate from the confirmation settings above."
+              ><img class="moveimage" src="/images/solid/question-circle.svg" /></a>
+              <br />
+              <em>What web pages are allowed to do. Saved as one setting.</em>
+              <br /><br />
+
+              <label
+                ><input type="checkbox" id="webAllowStoredKey" />
                 Allow web pages to use my stored keys (PGP)</label
               >
               <a
                 class="tooltip fade"
-                data-tooltip="Off by default. When off, web pages can only use derived keys, which are label-scoped and reproducible. Turn this on only if you use PGP in the OnlyKey web app."
+                data-tooltip="Off by default. When off, web pages can still use derived keys, which are label-scoped and reproducible. Turn this on only if you use PGP in the OnlyKey web app."
+              ><img class="moveimage" src="/images/solid/question-circle.svg" /></a>
+              <br />
+              <label
+                ><input type="checkbox" id="webDisableExtension" />
+                Block all browser access to this OnlyKey</label
+              >
+              <a
+                class="tooltip fade"
+                data-tooltip="Turns off the OnlyKey browser extension completely, including derived keys. If you had browser access turned off on older firmware, it stays off until you change it here."
               ><img class="moveimage" src="/images/solid/question-circle.svg" /></a>
               <br /><br />
 
-              <input type="button" id="derivedKeyOptionsSaveBtn" value="Save Derived Key Options" />
-              <br />
-            </form>
-            <form>
-              <b class="config-mode-required">Stored Key User Input Mode</b><a
-                href="https://docs.crp.to/usersguide.html#challenge-mode"
-                class="external tooltip fade"
-                data-tooltip="By default, you must enter a 3-digit Challenge Code on OnlyKey to perform SSH or PGP operations. Changing this option to 'Button Press' allows those operations by tapping any button on your OnlyKey."
-              ><img class="moveimage" src="/images/solid/question-circle.svg" /></a>
-              <br />
-              Enable or disable challenge for stored keys (SSH/PGP)
-              <br />
-              <input type="button" id="storedKeyChallengeCodeBtn" value="Challenge Code" />
-              <input type="button" id="storedKeyBtnPressBtn" value="Button Press" />
+              <input type="button" id="webcryptPolicySaveBtn" value="Save Web Browser Access" />
               <br />
             </form>
             <form>

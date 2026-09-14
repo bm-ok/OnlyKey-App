@@ -221,6 +221,8 @@ function OnlyKey(params = {}) {
     BACKUPKEYMODE: 20,
     derivedchallengeMode: 21,
     storedchallengeMode: 22,
+    webDeriveMode: 30,
+    webcryptPolicy: 31,
     SECPROFILEMODE: 23,
     TYPESPEED: 13,
     LEDBRIGHTNESS: 24,
@@ -942,6 +944,18 @@ OnlyKey.prototype.setstoredchallengeMode = function (storedchallengeMode) {
   });
 };
 
+OnlyKey.prototype.setwebDeriveMode = function (webDeriveMode) {
+  this.setSlot("XX", "webDeriveMode", webDeriveMode, async () => {
+    return await this.listenforvalue("web derived key mode");
+  });
+};
+
+OnlyKey.prototype.setwebcryptPolicy = function (webcryptPolicy) {
+  this.setSlot("XX", "webcryptPolicy", webcryptPolicy, async () => {
+    return await this.listenforvalue("webcrypt policy");
+  });
+};
+
 OnlyKey.prototype.sethmacchallengeMode = function (hmacchallengeMode) {
   this.setSlot("XX", "hmacchallengeMode", hmacchallengeMode, async () => {
     return await this.listenforvalue("HMAC Challenge Mode");
@@ -1602,13 +1616,15 @@ function enableAuthForms() {
   const backupModeBtn = document.getElementById("backupModeBtn");
   backupModeBtn.addEventListener("click", (e) => submitBackupMode(e, 1));
 
-  const storedKeyChallengeCodeBtn = document.getElementById("storedKeyChallengeCodeBtn");
-  storedKeyChallengeCodeBtn.addEventListener("click", (e) => submitstoredchallengeMode(e, 0));
-  const storedKeyBtnPressBtn = document.getElementById("storedKeyBtnPressBtn");
-  storedKeyBtnPressBtn.addEventListener("click", (e) => submitstoredchallengeMode(e, 1));
+  // The stored-key mode is now a radio group in the User Input Modes form
+  // above, alongside the other two families, instead of its own pair of
+  // buttons - one setting per key family, set and saved the same way.
 
-  const derivedKeyOptionsSaveBtn = document.getElementById("derivedKeyOptionsSaveBtn");
-  derivedKeyOptionsSaveBtn.addEventListener("click", (e) => submitderivedchallengeMode(e));
+  const userInputModesSaveBtn = document.getElementById("userInputModesSaveBtn");
+  userInputModesSaveBtn.addEventListener("click", (e) => submitUserInputModes(e));
+
+  const webcryptPolicySaveBtn = document.getElementById("webcryptPolicySaveBtn");
+  webcryptPolicySaveBtn.addEventListener("click", (e) => submitWebcryptPolicy(e));
 
   const disableModkeyModeBtn = document.getElementById("disableModkeyModeBtn");
   disableModkeyModeBtn.addEventListener("click", (e) => submitmodkeyMode(e, 0));
@@ -2489,17 +2505,38 @@ function submitstoredchallengeMode(e, storedchallengeMode) {
 // meaning and fails closed on anything it does not recognise. Bits 2 and 3 were removed
 // from the firmware and are never written. The firmware accepts this write only
 // in config mode.
-function submitderivedchallengeMode(e) {
+// These used to be one composed byte written to field 21. They are now four
+// independent settings in three EEPROM fields, so this is four writes, not one.
+// Field 21 briefly carried policy flags in its high nibble; that collided with
+// the firmware's input-mode enum for the same byte, so the policy bits moved to
+// their own field. Composing them again here would recreate the collision.
+//
+// USER_INPUT_NONE (2) is deliberately absent from the 21 and 22 radio groups.
+// Production firmware refuses the write outright and fails a stale 2 closed to
+// the challenge code, so offering the option would only produce an error the
+// user cannot act on. Field 30 does offer it, because there it is honoured -
+// for public-key derivation only; deriving a shared secret still floors at a
+// button press in firmware whatever this says.
+function selectedRadioValue(name, fallback) {
+  const el = document.querySelector('input[name="' + name + '"]:checked');
+  return el ? parseInt(el.value, 10) : fallback;
+}
+
+function submitUserInputModes(e) {
+  e && e.preventDefault && e.preventDefault();
+  myOnlyKey.setderivedchallengeMode(selectedRadioValue("derivedKeyInput", 0));
+  myOnlyKey.setstoredchallengeMode(selectedRadioValue("storedKeyInput", 0));
+  return myOnlyKey.setwebDeriveMode(selectedRadioValue("webDeriveInput", 1));
+}
+
+function submitWebcryptPolicy(e) {
   e && e.preventDefault && e.preventDefault();
 
-  var mode = 0;
-  if (document.getElementById("derivedKeyBtnPress").checked) mode = 1;
-  else if (document.getElementById("derivedKeyNoInput").checked) mode = 3;
+  var policy = 0;
+  if (document.getElementById("webAllowStoredKey").checked) policy |= 0x01;
+  if (document.getElementById("webDisableExtension").checked) policy |= 0x02;
 
-  if (document.getElementById("derivedKeyAllowWebPgp").checked) mode |= 0x10;
-  if (document.getElementById("derivedKeyDisableWeb").checked) mode |= 0x20;
-
-  return myOnlyKey.setderivedchallengeMode(mode);
+  return myOnlyKey.setwebcryptPolicy(policy);
 }
 
 function submithmacchallengeMode(e, hmacchallengeMode) {
