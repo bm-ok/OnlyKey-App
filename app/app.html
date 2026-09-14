@@ -812,7 +812,7 @@
               >
               <br /><br />
 
-              <u>Web browser derived keys</u>
+              <u>Webcrypt derived keys</u>
               <a
                 class="tooltip fade"
                 data-tooltip="Used by the OnlyKey web app for age encryption and other label-derived keys. This setting never changes which key is derived - only how you authorise it - so anything already encrypted to a label still decrypts."
@@ -834,11 +834,11 @@
               >
               <label
                 ><input type="radio" name="webDeriveInput" id="webDeriveNoInput" value="2" />
-                None - public keys only</label
+                None (no confirmation) - for unattended agents</label
               >
               <a
                 class="tooltip fade"
-                data-tooltip="Lets a trusted web page look up a derived PUBLIC key without a tap. Decrypting still requires a button press: the OnlyKey enforces that itself and this setting cannot turn it off."
+                data-tooltip="No confirmation at all for web derived keys - intended for an unattended agent using an SSH key from the derivation slot. While this is set, the OnlyKey web app can derive and decrypt silently whenever the key is unlocked. Off by default; leave it off unless you are running an agent that needs it."
               ><img class="moveimage" src="/images/solid/question-circle.svg" /></a>
               <br /><br />
 
@@ -846,35 +846,35 @@
               <br />
             </form>
             <form>
-              <b class="config-mode-required">Web Browser Access</b><a
+              <b class="config-mode-required">Webcrypt Access</b><a
                 href="https://docs.crp.to/webcrypt.html"
                 class="external tooltip fade"
-                data-tooltip="What web pages are allowed to do with this OnlyKey. Separate from the confirmation settings above."
+                data-tooltip="What Webcrypt - the OnlyKey web app - is allowed to do with this OnlyKey. The origins that can reach the key are compiled into the firmware; this is not a list you can add to. Separate from the confirmation settings above."
               ><img class="moveimage" src="/images/solid/question-circle.svg" /></a>
               <br />
-              <em>What web pages are allowed to do. Saved as one setting.</em>
+              <em>What the OnlyKey web app is allowed to do. Saved as one setting.</em>
               <br /><br />
 
               <label
                 ><input type="checkbox" id="webAllowStoredKey" />
-                Allow web pages to use my stored keys (PGP)</label
+                Allow Webcrypt to use my stored keys (PGP)</label
               >
               <a
                 class="tooltip fade"
-                data-tooltip="Off by default. When off, web pages can still use derived keys, which are label-scoped and reproducible. Turn this on only if you use PGP in the OnlyKey web app."
+                data-tooltip="Off by default. When off, Webcrypt can still use derived keys, which are label-scoped and reproducible. Turn this on only if you use PGP in the OnlyKey web app."
               ><img class="moveimage" src="/images/solid/question-circle.svg" /></a>
               <br />
               <label
                 ><input type="checkbox" id="webDisableExtension" />
-                Block all browser access to this OnlyKey</label
+                Turn off Webcrypt entirely</label
               >
               <a
                 class="tooltip fade"
-                data-tooltip="Turns off the OnlyKey browser extension completely, including derived keys. If you had browser access turned off on older firmware, it stays off until you change it here."
+                data-tooltip="Turns off the OnlyKey FIDO2 extension completely, including derived keys, so the web app cannot reach this key at all. If you had this turned off on older firmware, it stays off until you change it here."
               ><img class="moveimage" src="/images/solid/question-circle.svg" /></a>
               <br /><br />
 
-              <input type="button" id="webcryptPolicySaveBtn" value="Save Web Browser Access" />
+              <input type="button" id="webcryptPolicySaveBtn" value="Save Webcrypt Access" />
               <br />
             </form>
             <form>
