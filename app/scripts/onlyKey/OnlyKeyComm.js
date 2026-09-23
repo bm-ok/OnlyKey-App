@@ -2515,8 +2515,9 @@ function submitstoredchallengeMode(e, storedchallengeMode) {
 // Production firmware refuses the write outright and fails a stale 2 closed to
 // the challenge code, so offering the option would only produce an error the
 // user cannot act on. Field 30 does offer it, because there it is honoured -
-// for public-key derivation only; deriving a shared secret still floors at a
-// button press in firmware whatever this says.
+// for shared secrets and derived decapsulation too (firmware v3.0.5): with
+// "No confirmation" the web app and local agents derive and decrypt silently
+// whenever the key is unlocked, which is what the tooltip says.
 function selectedRadioValue(name, fallback) {
   const el = document.querySelector('input[name="' + name + '"]:checked');
   return el ? parseInt(el.value, 10) : fallback;
