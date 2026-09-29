@@ -347,7 +347,9 @@ const SLOT_FIELD = {
 /**
  * App preference setter field -> lib PREFERENCES name
  * (plugins/device/index.js PREFERENCES). All are OKSETSLOT on slot 'XX'.
- * SECPROFILEMODE is deliberately ABSENT - see LIB-PORT.md, lib gaps.
+ * SECPROFILEMODE is the lib's one SILENT preference: the firmware stores it
+ * without a word on first use, so setPreference resolves with
+ * `confirmed: false` instead of an answer (see setSecProfileMode).
  */
 const PREFERENCE = {
   LOCKOUT: 'lockout',
@@ -363,6 +365,7 @@ const PREFERENCE = {
   LEDBRIGHTNESS: 'ledBrightness',
   LOCKBUTTON: 'lockButton',
   KBDLAYOUT: 'keyboardLayout',
+  SECPROFILEMODE: 'secProfileMode',
 };
 
 /** The App's PIN message ids -> the lib's PIN kinds (src/protocol/msg.js PIN_KIND). */
@@ -377,7 +380,9 @@ const PIN_KIND = {
  * walks them (libraries okcore.cpp set_primary_pin: `pin_set` 0 -> 1 -> 2 ->
  * 3 -> 0). The lib's pinStep() runs one of these by label
  * (src/device/pin.js PIN_SEQUENCE); the two `digits` steps and `committed`
- * send nothing and are the person's, and the firmware's, respectively.
+ * send nothing and are the person's, and the firmware's, respectively. The
+ * facade runs `committed` straight after `matched` (sendPinMessage); it is not
+ * a step here because it sends nothing and so is not counted.
  *
  * Index = how many messages of this kind the firmware has taken since it was
  * last at pin_set 0, which is what the facade counts.

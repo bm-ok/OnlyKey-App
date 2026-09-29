@@ -180,17 +180,52 @@ describe('OnlyKeyComm facade: slots and settings', function () {
     expect(fake.sent.length).to.equal(before);
   });
 
-  it('second-profile mode (lib gap): the App\'s raw frame, and the callback without an answer', async () => {
-    const { app, fake } = await boot({ state: 'uninitialized' });
+  /*
+   * The three SILENT operations - second-profile mode, the global Yubico wipe
+   * and the no-file restart (below) - are the lib's now. The firmware says
+   * nothing when they work, so each is sent ONCE (never retried), silence
+   * returns quickly instead of after the lib's 10 s timeouts, and a refusal
+   * reaches the callback in the device's words.
+   */
+  const silentWithin = 3000;
+
+  it('second-profile mode on first use: the lib\'s silent preference, sent once, called back without an answer', async () => {
+    const { app, fake, dev } = await boot({ state: 'uninitialized' });
+    const t = Date.now();
     const [err] = await call(app, 'myOnlyKey.setSecProfileMode("1", __done)');
     expect(err).to.equal(null);
+    expect(Date.now() - t).to.be.below(silentWithin);
+    expect(frames(fake, 0xe6).filter((f) => f[6] === 23)).to.have.length(1);
     expect(frames(fake, 0xe6).pop().slice(0, 8)).to.deep.equal([0xff, 0xff, 0xff, 0xff, 0xe6, 0, 23, 1]);
+    expect(dev.secProfileMode).to.equal(1);
   });
 
-  it('global Yubico wipe (lib gap): the App\'s raw frame, sent without waiting for a reply that never comes', async () => {
+  it('second-profile mode after first use: the refusal (no "Error" in it) reaches the callback and the list', async () => {
     const { app, fake } = await boot({ state: 'unlocked' }, { settle: 'labels' });
-    await call(app, 'myOnlyKey.wipeYubiAuth(__done)');
+    const t = Date.now();
+    const [err] = await call(app, 'myOnlyKey.setSecProfileMode("2", __done)');
+    expect(err).to.equal('Second Profile Mode may only be changed on first use');
+    expect(last(app)).to.equal('Second Profile Mode may only be changed on first use');
+    expect(Date.now() - t).to.be.below(silentWithin);
+    expect(frames(fake, 0xe6).filter((f) => f[6] === 23)).to.have.length(1);
+  });
+
+  it('global Yubico wipe: device.wipeYubiAuth, sent once, and the list says SENT, not done', async () => {
+    const { app, fake, dev } = await boot({ state: 'unlocked' }, { settle: 'labels' });
+    const [err] = await call(app, 'myOnlyKey.wipeYubiAuth(__done)');
+    expect(err).to.equal(null);
+    expect(frames(fake, 0xe7)).to.have.length(1);
     expect(frames(fake, 0xe7).pop().slice(0, 7)).to.deep.equal([0xff, 0xff, 0xff, 0xff, 0xe7, 0, 10]);
+    expect(dev.yubiWiped).to.equal(true);
+    expect(last(app)).to.equal('Yubico OTP wipe sent (OnlyKey does not confirm this)');
+  });
+
+  it('global Yubico wipe on a locked key: the device\'s refusal reaches the callback', async () => {
+    const { app, dev } = await boot({ state: 'locked' });
+    const [err] = await call(app, 'myOnlyKey.wipeYubiAuth(__done)');
+    expect(err).to.equal('Error device locked');
+    expect(last(app)).to.equal('Error device locked');
+    expect(dev.yubiWiped).to.equal(false);
   });
 });
 
@@ -214,8 +249,12 @@ describe('OnlyKeyComm facade: the classic PIN bracket (wizard Steps 2-3)', funct
     expect([err, msg]).to.deep.equal([null, 'OnlyKey is ready, re-enter your PIN to confirm']);
 
     dev.press('1234567');
-    [err, msg] = await call(app, 'myOnlyKey.sendSetPin(__done)'); /* Step3 exitFn */
+    /* Step3 exitFn: matched, then the lib's committed, which has no console to
+     * wait for here and so must not cost its 10 s timeout. */
+    const t = Date.now();
+    [err, msg] = await call(app, 'myOnlyKey.sendSetPin(__done)');
     expect([err, msg]).to.deep.equal([null, 'Successfully set PIN']);
+    expect(Date.now() - t).to.be.below(3000);
 
     expect(dev.pins[0xe1]).to.equal('1234567');
     expect(app.run('myOnlyKey.pendingMessages.OKSETPIN')).to.equal(false);
@@ -274,7 +313,7 @@ describe('OnlyKeyComm facade: the classic PIN bracket (wizard Steps 2-3)', funct
     expect(app.run('myOnlyKey.pinSteps.OKSETSDPIN')).to.equal(1);
   });
 
-  it('any other "Error ..." ends the step at once instead of waiting out the lib\'s timeout', async () => {
+  it('any other "Error ..." ends the step at once: the lib\'s pinStep ends on any device refusal', async () => {
     const { app, dev } = await boot({ state: 'uninitialized' });
     dev.classicPin = function () { this.say('Error not in config mode'); };
     const t = Date.now();
@@ -283,6 +322,18 @@ describe('OnlyKeyComm facade: the classic PIN bracket (wizard Steps 2-3)', funct
     expect(sent).to.equal('OKSETPIN');
     expect(Date.now() - t).to.be.below(3000);
     expect(app.run('myOnlyKey.pinSteps.OKSETPIN || 0')).to.equal(0);
+  });
+
+  it('a refusal that does not begin "Error" ends the step too, and is on the list once', async () => {
+    const { app, dev } = await boot({ state: 'uninitialized' });
+    dev.classicPin = function () { this.say('No PIN set, You must set a PIN first'); };
+    const t = Date.now();
+    const [err, sent] = await call(app, 'myOnlyKey.sendSetPin(__done)');
+    expect(err).to.equal('No PIN set, You must set a PIN first');
+    expect(sent).to.equal('OKSETPIN');
+    expect(Date.now() - t).to.be.below(3000);
+    const list = app.run('myOnlyKey.lastMessages.received.map((m) => m.text)');
+    expect(list.filter((m) => m === 'No PIN set, You must set a PIN first')).to.have.length(1);
   });
 });
 
@@ -391,12 +442,25 @@ describe('OnlyKeyComm facade: keys, backup and restore', function () {
     expect(dev.restored[0].slice(1, 58)).to.deep.equal(new Array(57).fill(7));
   });
 
-  it('restore with no file (the wizard\'s "reboot" - lib gap): the App\'s all-zero OKRESTORE frame', async () => {
-    const { app, fake } = await boot({ state: 'uninitialized' });
+  it('restore with no file (the wizard\'s "reboot"): device.restartByRestore, a zero length byte the key restarts on', async () => {
+    const { app, fake, dev } = await boot({ state: 'uninitialized' });
     app.sandbox.__empty = {};
-    app.run('myOnlyKey.submitRestore(__empty, () => {})');
-    await until(() => last(app) === 'Backup file sent to OnlyKey.', { what: 'reboot request sent' });
+    const [err] = await call(app, 'myOnlyKey.submitRestore(__empty, __done)');
+    expect(err).to.equal(undefined);
+    expect(last(app)).to.equal('OnlyKey restart requested (OnlyKey does not confirm this)');
+    expect(frames(fake, 0xf1)).to.have.length(1);
     expect(frames(fake, 0xf1).pop()).to.deep.equal(asBuffer('\xff\xff\xff\xff\xf1'));
+    /* The length byte is an explicit 0 - not the old "4.8" -> NaN -> 0. */
+    expect(dev.restarts).to.equal(1);
+  });
+
+  it('restore with no file outside config mode: the key refuses, nothing restarts, the wizard is told', async () => {
+    const { app, dev } = await boot({ state: 'unlocked' }, { settle: 'labels' });
+    app.sandbox.__empty = {};
+    const [err, sent] = await call(app, 'myOnlyKey.submitRestore(__empty, __done)');
+    expect(err).to.equal('Error not in config mode');
+    expect(sent).to.equal('OKRESTORE');
+    expect(dev.restarts).to.equal(0);
   });
 });
 

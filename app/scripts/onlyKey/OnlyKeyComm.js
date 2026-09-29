@@ -51,9 +51,6 @@ let libBusy = 0;
 /* Callers of listen(): each takes the next report, as a receive() did. */
 const oneShotListeners = [];
 
-/* A classic PIN step in flight watches for any "Error ..." reply; see sendPinMessage. */
-let pinErrorWatch = null;
-
 let backupsigFlag = -1;
 let fwchecked = false;
 let dialog;
@@ -326,120 +323,15 @@ OnlyKey.prototype.setConnection = function (connectionId) {
   }
 };
 
-OnlyKey.prototype.sendMessage = function (options, callback) {
-  var bytesPerMessage = 64;
-
-  var msgId =
-    typeof options.msgId === "string" ? options.msgId.toUpperCase() : null;
-  var slotId =
-    typeof options.slotId === "number" || typeof options.slotId === "string"
-      ? options.slotId
-      : null;
-  var fieldId =
-    typeof options.fieldId === "string" || typeof options.fieldId === "number"
-      ? options.fieldId
-      : null;
-  var contents =
-    typeof options.contents === "number" ||
-    (options.contents && options.contents.length)
-      ? options.contents
-      : "";
-  var contentType =
-    (options.contentType && options.contentType.toUpperCase()) || "HEX";
-
-  callback = typeof callback === "function" ? callback : handleMessage;
-
-  var reportId = 0;
-  var bytes = new Uint8Array(bytesPerMessage);
-  var cursor = 0;
-
-  for (; cursor < this.messageHeader.length; cursor++) {
-    bytes[cursor] = this.messageHeader[cursor];
-  }
-
-  if (msgId && this.messages[msgId]) {
-    bytes[cursor] = strPad(this.messages[msgId], 2, 0);
-    cursor++;
-  }
-
-  if (slotId !== null) {
-    bytes[cursor] = strPad(slotId, 2, 0);   
-    cursor++;
-  }
-
-  if (fieldId !== null) {
-    if (this.messageFields[fieldId]) {
-      bytes[cursor] = strPad(this.messageFields[fieldId], 2, 0);
-    } else {
-      bytes[cursor] = fieldId;
-    }
-
-    cursor++;
-  }
-
-  if (!Array.isArray(contents)) {
-    switch (typeof contents) {
-      case "string":
-        contents = contents.replace(
-          /\\x([a-fA-F0-9]{2})/g,
-          (match, capture) => {
-            return String.fromCharCode(parseInt(capture, 16));
-          }
-        );
-
-        for (var i = 0; i < contents.length && cursor < bytes.length; i++) {
-          if (contents.charCodeAt(i) > 255) {
-            throw "I am not smart enough to decode non-ASCII data.";
-          }
-          bytes[cursor++] = contents.charCodeAt(i);
-        }
-        break;
-      case "number":
-        if (contents < 0 || contents > 255) {
-          throw "Byte value out of bounds.";
-        }
-        bytes[cursor++] = contents;
-        break;
-    }
-  } else {
-    contents.forEach(function (val) {
-      bytes[cursor++] = contentType === "HEX" ? hexStrToDec(val) : val;
-    });
-  }
-
-  var pad = 0;
-  for (; cursor < bytes.length; ) {
-    bytes[cursor++] = pad;
-  }
-
-  console.info(
-    "SENDING " + msgId + " to connectionId " + this.connection + ":",
-    bytes
-  );
-
-  myOnlyKey.setLastMessage("sent", msgId);
-
-  /*
-   * A RAW FRAME, through the lib's transport. Only the operations the lib has
-   * no method for still come here (docs/LIB-PORT.md, "lib gaps"): the frame
-   * is built exactly as it always was, and it goes out on the same pipe as
-   * everything else, so the reader and the pacing are shared. The 100 ms wait
-   * that used to follow every send (except OKFWUPDATE) is now in the pipe.
-   */
-  if (!okLib) {
-    console.error("ERROR SENDING" + (msgId ? " " + msgId : "") + ": not connected");
-    return callback("ERROR SENDING PACKETS");
-  }
-  okLib.transport.write(okLibPipe.IFACE.VENDOR, bytes).then(
-    () => callback(null, "OK"),
-    (err) => {
-      console.error("ERROR SENDING" + (msgId ? " " + msgId : "") + ":", err, {
-        connectionId: this.connection,
-      });
-      callback("ERROR SENDING PACKETS");
-    }
-  );
-};
+/*
+ * NO RAW FRAMES. sendMessage, which built a 64-byte frame by hand, is gone:
+ * every operation the App performs is now a lib method, including the three
+ * the port's first cut still sent by hand because the lib had no method for
+ * them (docs/LIB-PORT.md, "lib gaps"): the global Yubico wipe, second-profile
+ * mode and the no-file restart. The last caller was setSlot's fallback for a
+ * field the lib has no name for, and no field the App writes reaches it (see
+ * setSlot), so it now refuses instead of hand-building a frame.
+ */
 
 /**
  * Run one lib operation, marked as in flight for onVendorReport.
@@ -694,18 +586,25 @@ OnlyKey.prototype.getLabels = async function () {
  *
  * and the same for OKSETPIN2 (Steps 4/5, kind 'secondary') and OKSETSDPIN
  * (Steps 6/7, kind 'selfDestruct'). The count is the firmware's own
- * `pin_set`; the lib's 'committed' step is not run because the wire has
- * nothing more to say after "Successfully set PIN" and its console wait would
- * only time out on a release build.
+ * `pin_set`.
+ *
+ * 'committed' RUNS RIGHT AFTER 'matched', in the same call, because that is
+ * the lib's sequence and it now costs nothing: the wire says nothing after
+ * "Successfully set PIN", and the lib waits for the console's copy only when
+ * a console has spoken - which a release build's never does (its line is
+ * DEBUG-only) and this App's pipe, which opens only the vendor interface,
+ * never carries. The port's first cut skipped the step because the lib used
+ * to wait out the full timeout for it.
  *
  * A REFUSAL - "Error PIN is not between 7 - 10 digits" at 'stored', or at
  * 'matched' a mismatch - sends the firmware back to 0, so the count goes to 0
  * too, and the callback gets (message, msgId) exactly as pollForInput gave it,
  * which is what the wizard's goBackOnError switches on to return to Step2 / 4
- * / 6. Any other "Error ..." (not in config mode, locked) ends the step at
- * once as it did before - the lib's pinStep only knows the two PIN refusals
- * and would otherwise wait out its timeout (docs/LIB-PORT.md, lib gaps) - and
- * leaves the count alone, because the firmware never took the message.
+ * / 6. Any other refusal (not in config mode, locked) ends the step at once
+ * too: the lib's pinStep ends on ANY device refusal, not just the two PIN
+ * sentences (the App raced its own "Error" watcher for this until the lib
+ * did it). The count is left alone then, because the firmware never took the
+ * message.
  *
  * The DUO has no bracket: its PINs travel in the message (sendPin_DUO).
  */
@@ -729,25 +628,16 @@ OnlyKey.prototype.sendPinMessage = function ({ msgId = "", pin = "", poll = true
   const at = this.pinSteps[msgId] || 0;
   const label = okLibPipe.PIN_STEPS[at];
 
-  let unwatch = () => {};
-  const refused = new Promise((resolve, reject) => {
-    pinErrorWatch = (msg) => reject(new Error(msg));
-    unwatch = () => {
-      pinErrorWatch = null;
-    };
-  });
-  const step = libOp(msgId, (device) => device.pinStep(label, { kind }));
-  step.catch(() => {}); /* may lose the race below; its rejection is expected then */
-
-  Promise.race([step, refused]).then(
+  libOp(msgId, async (device) => {
+    await device.pinStep(label, { kind });
+    if (label === "matched") await device.pinStep("committed", { kind });
+  }).then(
     () => {
-      unwatch();
       this.pinSteps[msgId] = (at + 1) % okLibPipe.PIN_STEPS.length;
       this.pendingMessages[msgId] = this.pinSteps[msgId] % 2 === 1;
       callback(null, this.getLastMessage("received"));
     },
     (err) => {
-      unwatch();
       const text = errorText(err);
       if (/PIN is not between|PINs Don'?t Match/i.test(text)) {
         this.pinSteps[msgId] = 0;
@@ -846,13 +736,16 @@ OnlyKey.prototype.setSlot = function (slotArg, field, value, callback) {
     return setPreferenceField(field, value, done);
   }
 
+  /*
+   * A field the lib has no name for is REFUSED, not hand-built. Every field
+   * the wizard writes (OnlyKeyWizard.js setSlot's fieldMap) and setSlotTypeSpeed
+   * is in SLOT_FIELD, so this is reached only by a caller outside the App; the
+   * lib's setSlot is where a new field belongs, with its encoding and its
+   * acknowledgement, not a raw frame here that nobody would be waiting on.
+   */
   const name = okLibPipe && okLibPipe.SLOT_FIELD[field];
   if (!name) {
-    console.warn(`setSlot: no lib field for ${field}; sending the raw frame`);
-    return this.sendMessage(
-      { contents: value, msgId: "OKSETSLOT", slotId: slot, fieldId: field },
-      done
-    );
+    return done(reportLibError(new Error(`setSlot: the library has no slot field ${field}`)));
   }
 
   let fieldValue;
@@ -928,17 +821,28 @@ OnlyKey.prototype.setYubiAuth = function (
 };
 
 /*
- * LIB GAP - there is no lib method for this, and the lib's wipeSlot cannot
- * stand in: the firmware wipes the global credential SILENTLY (okcore.cpp
- * wipe_slot, `value == 10 && slot == 0` has no hidprint), and wipeSlot waits
- * for an acknowledgement. So this is the App's own raw frame, sent through the
- * lib's transport. The old code then waited for "wiped AES Key", which never
- * comes; this calls back once the frame is out.
+ * THE GLOBAL YUBICO WIPE = the lib's device.wipeYubiAuth().
+ *
+ * The firmware wipes the global credential SILENTLY (okcore.cpp wipe_slot,
+ * `value == 10 && slot == 0` has no hidprint), so there is no "wiped" answer to
+ * wait for - the old code waited for "wiped AES Key", which no release sends.
+ * The lib sends the frame ONCE, listens briefly for a refusal ("Error device
+ * locked", ...), and otherwise returns `confirmed: false`: silence is what
+ * success looks like, but it is also what a frame the key never acted on looks
+ * like. So the list says the wipe was SENT, never that it was done, and a
+ * refusal is shown as the device said it and passed to the callback.
  */
+const SILENT_NOTE = "OnlyKey does not confirm this";
+
 OnlyKey.prototype.wipeYubiAuth = function (callback) {
-  this.sendMessage({ msgId: "OKWIPESLOT", slotId: 0, fieldId: "YUBIAUTH" }, (err) => {
-    if (typeof callback === "function") callback(err);
-  });
+  const done = typeof callback === "function" ? callback : () => {};
+  libOp("OKWIPESLOT", (device) => device.wipeYubiAuth()).then(
+    () => {
+      this.setLastMessage("received", `Yubico OTP wipe sent (${SILENT_NOTE})`);
+      done(null);
+    },
+    (err) => done(reportLibError(err))
+  );
 };
 
 OnlyKey.prototype.setRSABackupKey = async function (key, passcode, cb) {
@@ -1066,10 +970,27 @@ OnlyKey.prototype.submitFirmware = function (fileSelector, cb) {
  *   - a file with NO digest line (firmware before v2.1.2) is sent, as the App
  *     always did - `unverifiable: true` is that decision, made here once
  *
- * The no-file path is NOT a restore: the wizard's Exit on the restore step
- * sends it to make the key restart ("Reboot Requested", OnlyKeyWizard.js).
- * The lib has nothing for that, so it is the App's own frame, byte for byte
- * (see submitRestoreData) - docs/LIB-PORT.md, lib gaps.
+ * The no-file path is NOT a restore: the wizard sends it to make the key
+ * restart - Exit on the restore step ("Reboot Requested", OnlyKeyWizard.js),
+ * and Next on it with no file chosen. That is the lib's
+ * device.restartByRestore(): one OKRESTORE frame whose length byte and data
+ * are zero, which the firmware's RESTORE takes as an empty last packet at
+ * offset 0 and answers with CPU_RESTART.
+ *
+ * THE ZERO IS NOW MEANT. The old App got the same 64 bytes by accident: it
+ * sent "000000000" (nine characters) through submitRestoreData, whose length
+ * header came out as (9/2).toString(16) = "4.8", which hexStrToDec turned
+ * into NaN and the Uint8Array stored as 0. A header of 4 would have been a
+ * 4-byte "backup" that the key went on to decrypt. The lib builds the frame
+ * with an explicit zero, and submitRestoreData and OnlyKey.prototype.restore,
+ * which existed only for this path, are gone.
+ *
+ * A restart answers nothing - the key drops off the bus - so the lib returns
+ * `confirmed: false` after listening briefly for a refusal. The firmware
+ * restarts only where a restore is allowed (config mode, or first use); on an
+ * unlocked key outside config mode it says "Error not in config mode", which
+ * reaches the list and the callback. The list says the restart was REQUESTED,
+ * because that is all the App can know.
  */
 OnlyKey.prototype.submitRestore = function (fileSelector, cbArg) {
   const cb = typeof cbArg === "function" ? cbArg : () => {};
@@ -1120,16 +1041,17 @@ OnlyKey.prototype.submitRestore = function (fileSelector, cbArg) {
     // Read in the image file as a data URL.
     reader.readAsText(file);
   } else {
-    var contents = "000000000";
-    submitRestoreData(contents, function (err) {
-      if (err) {
-        _this.setLastMessage("received", err);
-        throw Error(err);
-      }
-
-      _this.setLastMessage("received", "Backup file sent to OnlyKey.");
-      cb();
-    });
+    libOp("OKRESTORE", (device) => device.restartByRestore()).then(
+      () => {
+        _this.setLastMessage("received", `OnlyKey restart requested (${SILENT_NOTE})`);
+        cb();
+      },
+      /*
+       * A refusal stops the wizard where it is (goBackOnError has no case for
+       * OKRESTORE), which is where the old code left it when a send failed.
+       */
+      (err) => cb(reportLibError(err), "OKRESTORE")
+    );
   }
 };
 
@@ -1169,24 +1091,6 @@ OnlyKey.prototype.wipePrivateKey = function (slot, callback) {
 };
 
 /*
- * One raw OKRESTORE packet. Only the no-file "reboot" of submitRestore still
- * builds one (see there); a real backup goes through the lib's restore().
- */
-OnlyKey.prototype.restore = async function (
-  restoreData,
-  packetHeader,
-  callback
-) {
-  var msg = [packetHeader];
-  msg = msg.concat(restoreData.match(/.{2}/g));
-  var options = {
-    contents: msg,
-    msgId: "OKRESTORE",
-  };
-  this.sendMessage(options, callback);
-};
-
-/*
  * THE DEVICE-WIDE SETTINGS = the lib's device.setPreference(name, value).
  *
  * Every one is OKSETSLOT on slot 0 with one byte, and the lib's table
@@ -1213,22 +1117,29 @@ OnlyKey.prototype.setWipeMode = function (wipeMode) {
 };
 
 /*
- * LIB GAP - left as the App's raw frame. On first use the firmware takes the
- * second-profile mode SILENTLY (okcore.cpp set_slot case 23: its hidprint is
- * commented out) and refuses it later with a sentence that does not begin
- * "Error", so the lib's setPreference('secProfileMode') would wait out three
- * 10 s attempts on exactly the path the wizard uses - mid PIN bracket, Step4.
- * The old behaviour, a send and a callback, is the one that works.
+ * SECOND-PROFILE MODE = the lib's device.setPreference('secProfileMode').
+ *
+ * On first use the firmware stores it SILENTLY (okcore.cpp set_slot case 23:
+ * its hidprint is commented out) and refuses it later with "Second Profile
+ * Mode may only be changed on first use", which does not begin "Error". The
+ * lib now knows both: it sends the frame once, takes silence as set and
+ * returns `confirmed: false`, and throws that sentence as a refusal - where it
+ * used to wait out three 10 s attempts on exactly the path the wizard uses,
+ * mid PIN bracket (Step4 exitFn).
+ *
+ * The callback still runs either way, as the raw send's did: the wizard hands
+ * it sendSetPin2, which ignores what it is given and continues the bracket.
+ * Nothing is added to the list on silence - there is nothing true to say
+ * beyond "sent", and the PIN step that follows speaks next. A refusal is on
+ * the list already, in the device's words.
  */
 OnlyKey.prototype.setSecProfileMode = function (secProfileMode, callback) {
-  secProfileMode = parseInt(secProfileMode, 10);
-  var options = {
-    contents: secProfileMode,
-    msgId: "OKSETSLOT",
-    slotId: "XX",
-    fieldId: "SECPROFILEMODE",
-  };
-  this.sendMessage(options, callback);
+  const done = typeof callback === "function" ? callback : () => {};
+  const mode = parseInt(secProfileMode, 10);
+  libOp("OKSETSLOT", (device) => device.setPreference("secProfileMode", mode)).then(
+    () => done(null, "OK"),
+    (err) => done(reportLibError(err))
+  );
 };
 
 OnlyKey.prototype.setderivedchallengeMode = function (derivedchallengeMode) {
@@ -1612,7 +1523,6 @@ async function closeLib() {
   const lib = okLib;
   okLib = null;
   oneShotListeners.length = 0;
-  pinErrorWatch = null;
   setTimeWaiters = null;
   if (!lib) return;
   lib.off();
@@ -1671,10 +1581,6 @@ function onVendorReport(data) {
 
   if (msg.length > 1 && msg !== "OK" && !flushing) {
     myOnlyKey.setLastMessage("received", msg);
-  }
-
-  if (pinErrorWatch && (msg.indexOf("Error") === 0 || msg.indexOf("ERROR") === 0)) {
-    pinErrorWatch(msg);
   }
 
   /* The lib's capabilities follow the version the key reports once unlocked. */
@@ -2430,31 +2336,6 @@ function submitRestoreForm(e) {
   } else {
     ui.restoreForm.setError("Please select a file first.");
   }
-}
-
-/*
- * Raw OKRESTORE packets. Only the wizard's no-file "reboot request" uses this
- * now (submitRestore); its nine zeros become one packet whose header byte and
- * data are all zero, which is the frame the key has always been sent here.
- * Real backups go through the lib's restore().
- */
-function submitRestoreData(restoreData, callback) {
-  // this function should recursively call itself until all bytes are sent in chunks
-  if (!restoreData.length) {
-    return callback();
-  }
-
-  var maxPacketSize = 114; // 57 byte pairs
-  var finalPacket = restoreData.length - maxPacketSize <= 0;
-
-  var cb = finalPacket
-    ? callback
-    : submitRestoreData.bind(null, restoreData.slice(maxPacketSize), callback);
-
-  // packetHeader is hex number of bytes in certStr chunk
-  var packetHeader = finalPacket ? (restoreData.length / 2).toString(16) : "FF";
-
-  myOnlyKey.restore(restoreData.slice(0, maxPacketSize), packetHeader, cb);
 }
 
 function submitFirmwareForm(e) {
