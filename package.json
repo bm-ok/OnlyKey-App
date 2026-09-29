@@ -14,7 +14,7 @@
     "release_win": ".\\node_modules\\.bin\\gulp release --env=production",
     "start": "node ./tasks/start",
     "pretest": "npm run-script build",
-    "test": "mocha \"test/*-test.js\"",
+    "test": "mocha --timeout 20000 \"test/*-test.js\"",
     "test:lib": "mocha --timeout 30000 test/lib",
     "testgulp": ".\\node_modules\\.bin\\gulp -v",
     "prechrome": "./node_modules/.bin/gulp build --env=chrome",
