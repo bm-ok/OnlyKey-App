@@ -103,28 +103,13 @@ if (typeof nw == 'undefined') {
 
         chrome.hid.getDevices(deviceInfo, onDevicesEnumerated);
     }
-} else if (!localStorage.hasOwnProperty('autoLaunch')) {
-    // default autoLaunch to true if first time running app
-    const AutoLaunch = require('auto-launch');
-    const appPath = require('./scripts/non-renderer-app-path');
-    const appName = appPath.includes('nwjs Helper') ? 'OnlyKey-dev' : 'OnlyKey';
-    const userPreferences = require('./scripts/userPreferences.js');
-    const os = require('os');
-    const osx = os.platform() === 'darwin';
-    const autoLaunchOptions = {
-        name: appName,
-        isHidden: true
-    };
-
-    if (osx) {
-        autoLaunchOptions.path = appPath;
-        autoLaunchOptions.isHidden = false;
-    }
-
-    const autoLaunch = new AutoLaunch(autoLaunchOptions);
-    autoLaunch.enable();
-    userPreferences.autoLaunch = true;
 }
+// NW.js no longer runs this file. package.json "main" opens app.html directly:
+// on NW 0.114 a window created from this Chrome-app background page never
+// finishes loading (readyState stays "loading", DOMContentLoaded never fires),
+// even for an empty page - Windows and Linux alike. This file stays for the
+// Chrome build (manifest.json). The first-run auto-launch default it used to set
+// under NW now lives in scripts/tray.js.
 
 function setTime(connectionId) {
     var currentEpochTime = Math.round(new Date().getTime() / 1000.0).toString(16);

@@ -35,6 +35,15 @@
   }
 
   const autoLaunch = new AutoLaunch(autoLaunchOptions);
+
+  // First run: auto-launch defaults to ON. app.js did this as NW's background
+  // script until the NW 0.114 move (NW now opens app.html directly - see app.js).
+  // "First run" = no autoLaunch key yet; the isEnabled() read below records one
+  // on every launch, so this runs once per profile.
+  if (typeof localStorage !== 'undefined' && !localStorage.hasOwnProperty('autoLaunch')) {
+    await autoLaunch.enable().catch(console.error);
+  }
+
   let autoLaunchEnabledInOSAtLaunch;
   await autoLaunch.isEnabled().then(isEnabled => {
     autoLaunchEnabledInOSAtLaunch = isEnabled;

@@ -31,6 +31,15 @@ module.exports.getNodeModulesDir = function (params = {}) {
     : "node_modules";
 };
 
+// The NW.js runtime directory (nw.exe / nw / nwjs.app and everything beside it).
+// Newer nw packages unpack to node_modules/nw/nwjs[-sdk]-v<version>-<platform>-<arch>/
+// (0.71 used node_modules/nw/nwjs), and their findpath() is async. Ask the package
+// rather than hard-coding the folder, so the next NW bump needs no task change.
+module.exports.nwRuntimeDir = async function (nodeModulesDir = "node_modules") {
+  const nw = require(require("path").resolve(nodeModulesDir, "nw"));
+  return nw.findpath("all");
+};
+
 function getEnvName() {
   return argv.env || "development";
 }

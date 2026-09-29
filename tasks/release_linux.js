@@ -28,9 +28,10 @@ var init = function (params={}) {
 };
 
 var copyRuntime = function () {
-    // this pulls all files and directories from node_modules/nw/nwjs
+    // this pulls all files and directories from the NW.js runtime directory
     // and copies them into /opt/OnlyKey
-    return projectDir.copyAsync(`${node_modules_dir}/nw/nwjs`, readyAppDir.path(), { overwrite: true });
+    return utils.nwRuntimeDir(node_modules_dir)
+        .then((nwDir) => projectDir.copyAsync(nwDir, readyAppDir.path(), { overwrite: true }));
 };
 
 var copyBuiltApp = function () {

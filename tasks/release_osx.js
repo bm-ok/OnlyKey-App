@@ -2,7 +2,8 @@
 
 const Q = require('q');
 const jetpack = require('fs-jetpack');
-const { replace } = require('./utils');
+const utils = require('./utils');
+const { replace } = utils;
 
 let projectDir;
 let releasesDir;
@@ -26,18 +27,20 @@ const copyRuntime = function () {
     // When copying files, ignore `ljproj` files. Otherwise, the application
     // name will show up as 'nwjs'. Thanks to
     // https://github.com/nwjs-community/nw-builder/
-    console.log(`Copying runtime file nwjs.app from ${projectDir.path(node_modules_dir)}/nw/nwjs...`);
+    return utils.nwRuntimeDir(node_modules_dir).then((nwDir) => {
+        console.log(`Copying runtime file nwjs.app from ${nwDir}...`);
 
-    projectDir.copy(`${node_modules_dir}/nw/nwjs/nwjs.app/Contents`,
-        finalAppDir.path(),
-        { matching: [ 'Versions'] });
+        projectDir.copy(`${nwDir}/nwjs.app/Contents`,
+            finalAppDir.path(),
+            { matching: [ 'Versions'] });
 
-    return projectDir.copyAsync(`${node_modules_dir}/nw/nwjs/nwjs.app`,
-        finalAppDir.path(),
-        {
-            overwrite: true,
-            matching: [ 'Contents/**/*', '!Contents/Resources/*.lproj/*' ]
-        });
+        return projectDir.copyAsync(`${nwDir}/nwjs.app`,
+            finalAppDir.path(),
+            {
+                overwrite: true,
+                matching: [ 'Contents/**/*', '!Contents/Resources/*.lproj/*' ]
+            });
+    });
 };
 
 const copyBuiltApp = function () {

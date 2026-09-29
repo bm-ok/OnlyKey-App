@@ -107,11 +107,28 @@ And what the closed gaps cannot do, because the firmware gives nothing more to g
 - **Settings refused by the lib appear on the message list.** Examples are an out-of-range value, or webAgentDeriveMode or webcryptPolicy on firmware older than 3.0.5.
 - **`onDeviceRemoved` always updates the UI.** Before, a disconnect error made it return early.
 
-## Not verified: these need a device, and NW.js
+## NW.js 0.114 (was 0.71.1)
 
-`npm run test:lib` passes (52 tests). It covers the pipe, the lib stack against a scripted key, and the real page scripts in a vm with a fake DOM. The following have **not** been run:
+The lib cannot load on NW 0.71.1, and on NW 0.114 the old launch path cannot finish loading. Both were measured on Windows and Linux with a CDP probe of the page (2026-09-29):
 
-- **The App launching in NW.js 0.71.** `npm install` did not run the `nw` postinstall (`npm warn allow-scripts`: nw, es5-ext), so there is no NW binary or chromedriver. This means the selenium suites were not run either. Two assumptions are untested: that relative `require("./scripts/onlyKey/libPipe.js")` resolves in the page (it matches `./scripts/userPreferences.js`), and that chrome.hid accepts the page-made `ArrayBuffer`.
+| NW | launch | page | lib |
+|---|---|---|---|
+| 0.71.1 (Node 19.3) | Chrome-app background (`main: app.js`) | completes | **fails**: `require()` of the lib's vendored ES-module @noble; Node 19 has no require(esm). `okLibPipe` stays null and the App never reaches the key |
+| 0.114 (Node 26) | Chrome-app background | **stays `loading`**, even for an empty page, and even with `persistent: true` | loads |
+| 0.114 | `main: app.html` | completes | loads, App reads the key |
+
+The master branch (6.0.0 before the port) hangs the same way on 0.114, so the hang is NW's, not the port's. So:
+
+- `package.json`: `nw` is pinned to `0.114.0`, `main` is `app.html`, and the `window` block is 1024x768, the size `app.js` used to open. `allowScripts` approves nw's postinstall, which downloads the runtime; npm 11 skips it otherwise.
+- `app/app.js` no longer runs under NW. It stays as the Chrome build's background page. Its first-run auto-launch default moved to `app/scripts/tray.js`.
+- The nw package now unpacks to `node_modules/nw/nwjs-v<version>-<platform>-<arch>/`, and its `findpath()` is async. `tasks/utils.js` `nwRuntimeDir()` asks the package, and `start.js` plus the three release tasks use it.
+- The normal flavor has no devtools or remote debugging. To probe a page, run the same build with `nw@0.114.0-sdk`.
+
+## Not verified: these need a device
+
+`npm run test:lib` passes (52 tests). It covers the pipe, the lib stack against a scripted key, and the real page scripts in a vm with a fake DOM. The App also starts on NW 0.114 and reads the emulated key (Windows, okvhid). The following have **not** been run:
+
+- **The selenium suites.** `test/driver.js` looks for chromedriver at `node_modules/nw/nwjs/`. That path is gone in 0.114, and chromedriver ships only with the `-sdk` flavor.
 - **Any real key.** Nothing has been tested against hardware: timings, locked broadcasts, the VM case the double OKSETTIME was for, the DUO config-mode path (`INITIALIZED-D` → `setTime` loop, now coalesced), and how the bootloader answers the lib's OKCONNECT (time plus a 32-byte transit key; the old OKSETTIME carried only the time).
 - **Firmware update has only been run against the scripted mock. Do not test it on a key you cannot re-image.**
 - **`test/configure-slot-test.js` (selenium) will need rework.** It injects replies before the requests they answer, relying on Chrome's queue to feed whichever one-shot reader asked next. It also indexes `_sent` on the assumption that slot writes are not acknowledged. The mock hooks themselves still work.

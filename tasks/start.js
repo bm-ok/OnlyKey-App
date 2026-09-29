@@ -47,8 +47,9 @@ var runGulpWatch = function () {
     });
 };
 
-var runApp = function () {
-    var app = childProcess.spawn(nw.findpath(), ['./build'], {
+var runApp = async function () {
+    // findpath() is async since the nw package went ESM (0.9x).
+    var app = childProcess.spawn(await nw.findpath(), ['./build'], {
         stdio: 'inherit'
     });
 
