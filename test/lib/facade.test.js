@@ -304,6 +304,9 @@ describe('OnlyKeyComm facade: DUO PINs', function () {
     dev.pins.duo = '1234567';
     expect(app.run('myOnlyKey.getDeviceType()')).to.equal('duo');
     await call(app, 'myOnlyKey.sendPin_DUO(["1234567"], false, __done)');
+    /* The fake sends a stale INITIALIZED-D tick first; duoPin skips it, so the
+     * dialog logic judged the UNLOCKED answer, not the broadcast (gap 6). */
+    expect(last(app)).to.equal('UNLOCKEDv3.0.4-prodp');
     await until(() => Array.isArray(app.run('myOnlyKey.labels')) && app.run('myOnlyKey.labels').length === 24,
       { what: 'DUO labels after unlock', timeoutMs: 8000 });
     expect(app.run('myOnlyKey.isLocked')).to.equal(false);
@@ -312,7 +315,11 @@ describe('OnlyKeyComm facade: DUO PINs', function () {
   it('a wrong DUO PIN leaves it locked and the dialog logic sees INITIALIZED-D', async () => {
     const { app, dev } = await boot({ model: 'duo', state: 'locked', version: 'v3.0.4-prodp' });
     dev.pins.duo = '1234567';
+    const t = Date.now();
     await call(app, 'myOnlyKey.sendPin_DUO(["7777777"], false, __done)');
+    /* The answer is the tick AFTER the PIN was read, a period later - not the
+     * stale tick that arrives right after the write. */
+    expect(Date.now() - t).to.be.at.least(dev.duoTickMs);
     expect(last(app)).to.equal('INITIALIZED-D');
     expect(app.run('myOnlyKey.isLocked')).to.equal(true);
     expect(app.dom.byId('locked-text-duo').classList.contains('hide')).to.equal(false);

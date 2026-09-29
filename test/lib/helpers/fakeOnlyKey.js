@@ -44,6 +44,11 @@ class FakeOnlyKey {
     this.slotWrites = [];            // {slot, field, data}
     this.keys = {};                  // slot -> {type, bytes}
     this.restored = [];
+    this.restoreOffset = 0;          // RESTORE's static `offset`
+    this.restarts = 0;               // CPU_RESTARTs an empty restore caused
+    this.secProfileMode = null;
+    this.yubiWiped = false;
+    this.duoTickMs = 700;            // a locked DUO's broadcast period, shortened
     this.pinSet = { 0xe1: 0, 0xe2: 0, 0xe3: 0 };
     this.guess = '';
     this.stored = null;
@@ -91,7 +96,13 @@ class FakeOnlyKey {
         return undefined;
 
       case MSG.OKSETSLOT: {
-        if (slot === 0 && field === 23) return undefined; // 2nd profile mode: silent (okcore.cpp case 23)
+        if (slot === 0 && field === 23) {
+          /* 2nd profile mode (okcore.cpp set_slot case 23): stored in silence on
+           * first use, refused afterwards with a sentence that has no "Error". */
+          if (this.state !== 'uninitialized') return this.say('Second Profile Mode may only be changed on first use');
+          this.secProfileMode = frame[7];
+          return undefined;
+        }
         const data = Array.from(frame.slice(7));
         this.slotWrites.push({ slot, field, data });
         const names = { 1: 'Label', 5: 'Password', 6: 'Additional Character3', 2: 'Username', 11: 'idle timeout', 13: 'typespeed', 24: 'LED brightness' };
@@ -99,7 +110,13 @@ class FakeOnlyKey {
       }
 
       case MSG.OKWIPESLOT:
-        if (slot === 0 && field === 10) return undefined; // global Yubico wipe: silent
+        if (slot === 0 && field === 10) {
+          /* Global Yubico wipe (okcore.cpp wipe_slot): no hidprint when it works;
+           * the dispatcher still refuses a key that is not unlocked. */
+          if (this.state !== 'unlocked') return this.say('Error device locked');
+          this.yubiWiped = true;
+          return undefined;
+        }
         this.say('Successfully wiped Label');
         return this.say('Successfully wiped URL');
 
@@ -134,7 +151,19 @@ class FakeOnlyKey {
         return this.say(slot > 100 ? 'Successfully wiped ECC Private Key' : 'Successfully wiped RSA Private Key');
 
       case MSG.OKRESTORE:
+        /* Allowed only in config mode or on first use (okcore.cpp:516). */
+        if (this.state === 'unlocked' && !this.configMode) return this.say('Error not in config mode');
         this.restored.push(Array.from(frame.slice(5)));
+        /* RESTORE: a LAST packet ([5] != 0xFF) of length 0 with nothing before
+         * it (offset 0) is CPU_RESTART (okcore.cpp:6535). Any other length byte
+         * would be backup data - the old App's "4.8" header only became 0 by
+         * NaN, so the length byte is what this checks. */
+        if (frame[5] !== 0xff && this.restoreOffset === 0 && frame[5] === 0) {
+          this.restarts += 1;
+          return undefined;
+        }
+        this.restoreOffset += frame[5] === 0xff ? 57 : frame[5];
+        if (frame[5] !== 0xff) this.restoreOffset = 0;
         return undefined;
 
       case MSG.OKFWUPDATE:
@@ -188,11 +217,22 @@ class FakeOnlyKey {
       return this.say('Successfully set PIN');
     }
     const tried = body.filter((b) => b).map((b) => String.fromCharCode(b)).join('');
-    if (this.state === 'locked' && tried === this.pins.duo) {
-      this.state = 'unlocked';
-      return this.say(this.status());
+    if (this.state !== 'locked') return this.say(this.status());
+    /*
+     * A LOCKED DUO reads the PIN only in its once-a-period broadcast tick
+     * (OnlyKey.ino sendInitialized). Modelled at its worst: a tick that ran
+     * before the PIN arrived reaches the host right after the write (not the
+     * answer), then the consuming tick says UNLOCKED... for a right PIN and
+     * NOTHING for a wrong one, whose only "no" is the next tick's
+     * INITIALIZED-D, a whole period later.
+     */
+    this.broadcast();
+    if (tried === this.pins.duo) {
+      setTimeout(() => { this.state = 'unlocked'; this.broadcast(); }, 50);
+    } else {
+      setTimeout(() => this.broadcast(), 50 + this.duoTickMs);
     }
-    return this.say(this.status());
+    return undefined;
   }
 
   firmware(frame) {
