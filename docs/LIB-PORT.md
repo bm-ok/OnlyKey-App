@@ -126,7 +126,7 @@ The master branch (6.0.0 before the port) hangs the same way on 0.114, so the ha
 
 ## Not verified: these need a device
 
-`npm run test:lib` passes (52 tests). It covers the pipe, the lib stack against a scripted key, and the real page scripts in a vm with a fake DOM. The App also starts on NW 0.114 and reads the emulated key (Windows, okvhid). The following have **not** been run:
+`npm run test:lib` passes (52 tests). It covers the pipe, the lib stack against a scripted key, and the real page scripts in a vm with a fake DOM. The App also starts on NW 0.114 and reads the emulated key on Windows (okvhid) and Linux (USB gadget); the kit's 04-app section passes 29/0/0 on the VM (2026-09-29). The following have **not** been run:
 
 - **The selenium suites.** `test/driver.js` looks for chromedriver at `node_modules/nw/nwjs/`. That path is gone in 0.114, and chromedriver ships only with the `-sdk` flavor.
 - **Any real key.** Nothing has been tested against hardware: timings, locked broadcasts, the VM case the double OKSETTIME was for, the DUO config-mode path (`INITIALIZED-D` → `setTime` loop, now coalesced), and how the bootloader answers the lib's OKCONNECT (time plus a 32-byte transit key; the old OKSETTIME carried only the time).
