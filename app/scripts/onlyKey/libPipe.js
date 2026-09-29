@@ -433,5 +433,6 @@ module.exports = {
   /* The lib's modules the facade builds with, from the lib's public exports. */
   lib: {
     protocol: require('node-onlykey-lib/protocol'),
+    device: require('node-onlykey-lib/device'),
   },
 };

@@ -6,6 +6,54 @@ if (desktopApp) {
   request = require("request");
 }
 
+/*
+ * THE DEVICE HALF OF THIS FILE IS A FACADE OVER node-onlykey-lib.
+ *
+ * The OnlyKey object below keeps every method name and callback signature the
+ * wizard (OnlyKeyWizard.js) and the form handlers call, and every
+ * last-message string the UI branches on. Underneath, the protocol is the
+ * lib's: the frames, the PIN bracket, the label reader, the acknowledgement
+ * waits, backup, restore and firmware load are its code, the code the other
+ * GUIs run. See docs/LIB-PORT.md for the method-by-method mapping.
+ *
+ * What stays in the App: hot-plug (which collection to open, and when), the
+ * UI state machine keyed on message wording, and the DOM.
+ *
+ * ONE READER. chrome.hid.receive used to be called from wherever a reply was
+ * wanted (pollForInput, re-armed by each handler). The lib needs a stream, so
+ * libPipe.js runs a self-re-arming receive loop and it is the only reader; the
+ * old one-shot reader is gone entirely, not left beside it, because two
+ * readers on one connection each take every other report. Every report then
+ * reaches onVendorReport() below, which does what pollForInput did to each
+ * message (record it, learn the version, track lock state) and hands
+ * unsolicited ones to handleMessage, as the idle pollForInput loop did.
+ */
+let okLibPipe = null;
+if (typeof require === "function") {
+  try {
+    okLibPipe = require("./scripts/onlyKey/libPipe.js");
+  } catch (err) {
+    console.error("node-onlykey-lib could not be loaded:", err);
+  }
+}
+
+/* The lib stack while a key is connected: {app, pipe, transport, device, off}. */
+let okLib = null;
+
+/*
+ * How many lib operations are in flight. While one is, its replies are ITS -
+ * the lib is waiting on them - and are not also handed to handleMessage, the
+ * same way a reply the old code read into a callback never reached
+ * handleMessage. See onVendorReport.
+ */
+let libBusy = 0;
+
+/* Callers of listen(): each takes the next report, as a receive() did. */
+const oneShotListeners = [];
+
+/* A classic PIN step in flight watches for any "Error ..." reply; see sendPinMessage. */
+let pinErrorWatch = null;
+
 let backupsigFlag = -1;
 let fwchecked = false;
 let dialog;
@@ -250,6 +298,15 @@ function OnlyKey(params = {}) {
   };
 
   this.pendingMessages = {};
+
+  /*
+   * How far the classic PIN bracket has got, per PIN message id: the number
+   * of messages of that kind the firmware has taken since its `pin_set` was
+   * last 0 (okcore.cpp set_primary_pin and siblings). pendingMessages above is
+   * this count's parity, which is all the old code tracked; the count itself
+   * says WHICH step comes next, and that is what the lib's pinStep() needs.
+   */
+  this.pinSteps = {};
   this.version = "";
 }
 
@@ -362,22 +419,69 @@ OnlyKey.prototype.sendMessage = function (options, callback) {
 
   myOnlyKey.setLastMessage("sent", msgId);
 
-  chromeHid.send(this.connection, reportId, bytes.buffer, async function () {
-    if (msgId != "OKFWUPDATE") await wait(100);
-    if (chrome.runtime.lastError) {
-      console.error(
-        "ERROR SENDING" + (msgId ? " " + msgId : "") + ":",
-        chrome.runtime.lastError,
-        {
-          connectionId: this.connection,
-        }
-      );
+  /*
+   * A RAW FRAME, through the lib's transport. Only the operations the lib has
+   * no method for still come here (docs/LIB-PORT.md, "lib gaps"): the frame
+   * is built exactly as it always was, and it goes out on the same pipe as
+   * everything else, so the reader and the pacing are shared. The 100 ms wait
+   * that used to follow every send (except OKFWUPDATE) is now in the pipe.
+   */
+  if (!okLib) {
+    console.error("ERROR SENDING" + (msgId ? " " + msgId : "") + ": not connected");
+    return callback("ERROR SENDING PACKETS");
+  }
+  okLib.transport.write(okLibPipe.IFACE.VENDOR, bytes).then(
+    () => callback(null, "OK"),
+    (err) => {
+      console.error("ERROR SENDING" + (msgId ? " " + msgId : "") + ":", err, {
+        connectionId: this.connection,
+      });
       callback("ERROR SENDING PACKETS");
-    } else {
-      callback(null, "OK");
     }
-  });
+  );
 };
+
+/**
+ * Run one lib operation, marked as in flight for onVendorReport.
+ *
+ * `sentLabel` is recorded as the last message SENT, as sendMessage recorded
+ * its msgId - handleMessage and goBackOnError branch on it.
+ */
+function libOp(sentLabel, run) {
+  if (!okLib) return Promise.reject(new Error("OnlyKey is not connected"));
+  if (sentLabel) myOnlyKey.setLastMessage("sent", sentLabel);
+  const lib = okLib;
+  libBusy++;
+  return Promise.resolve()
+    .then(() => run(lib.device, lib))
+    .finally(() => {
+      libBusy--;
+    });
+}
+
+/** An error's text, whatever shape it arrived in. */
+function errorText(err) {
+  return String((err && err.message) || err || "");
+}
+
+/**
+ * Show a lib refusal the device never said.
+ *
+ * A reply from the device is already on the last-message list (onVendorReport
+ * records every one). A refusal the LIB makes - a value out of range, a
+ * missing acknowledgement - never crossed the wire, so without this the user
+ * would see nothing at all.
+ */
+function reportLibError(err) {
+  const text = errorText(err);
+  console.error("OnlyKey:", text);
+  const last = myOnlyKey.getLastMessage("received");
+  const saidByDevice = (err && err.deviceText) || (last && text.includes(last));
+  if (text && !saidByDevice) {
+    myOnlyKey.setLastMessage("received", text);
+  }
+  return (err && err.deviceText) || text;
+}
 
 OnlyKey.prototype.setLastMessage = function (type, msgStr = "") {
   if (msgStr) {
@@ -414,6 +518,23 @@ OnlyKey.prototype.getLastMessageIndex = function (type, index) {
     : "";
 };
 
+/*
+ * CANCEL A HALF-FINISHED CLASSIC PIN ENTRY.
+ *
+ * The firmware's PIN bracket is a toggle: each OKSETPIN (or OKSETPIN2 /
+ * OKSETSDPIN) advances `pin_set` 0 -> 1 -> 2 -> 3 -> 0, and entry is OPEN on
+ * the odd counts. A wizard step that is left while entry is open (Cancel,
+ * Exit, "skip", a panel switch) leaves the device capturing button presses,
+ * so every step's enterFn flushes first. Flushing is sending the next message
+ * of that kind: with no digits pressed the firmware refuses it ("PIN is not
+ * between 7 - 10 digits", or a mismatch) and goes back to 0 - okcore.cpp
+ * set_primary_pin cases 1 and 3.
+ *
+ * Same contract as before: one pending kind at a time, "Canceled" as the last
+ * received message, then the callback. The flush reply itself is NOT recorded
+ * on the message list (the old pollForInput({flush: true})), which is what
+ * `this.flushing` tells onVendorReport.
+ */
 OnlyKey.prototype.flushMessage = async function (callback = () => {}) {
   const messageTypes = Object.keys(this.pendingMessages);
   const pendingMessagesTypes = messageTypes.filter(
@@ -428,125 +549,215 @@ OnlyKey.prototype.flushMessage = async function (callback = () => {}) {
   const msgId = pendingMessagesTypes[0];
 
   console.info(`Flushing pending ${msgId}.`);
-  this.sendPinMessage({ msgId, poll: false }, () => {
-    pollForInput({ flush: true }, (err, msg) => {
-      this.setLastMessage("received", "Canceled");
-      if (msg) {
-        console.info("Flushed previous message.");
-        return this.flushMessage(callback);
-      } else {
-        return callback();
-      }
-    });
+  this.flushing = true;
+  this.sendPinMessage({ msgId, poll: false }, (err, msg) => {
+    this.flushing = false;
+    this.setLastMessage("received", "Canceled");
+    if (this.pendingMessages[msgId] === true) {
+      /*
+       * Still odd: the device did not answer at all, so its state is unknown.
+       * Given up on rather than retried - the old code waited forever here,
+       * and retrying a silent device would loop. The next step's own message
+       * will say where the device is.
+       */
+      console.warn(`Flush of ${msgId} got no answer (${err}); giving up on it.`);
+      this.pendingMessages[msgId] = false;
+      return callback();
+    }
+    console.info("Flushed previous message.");
+    return this.flushMessage(callback);
   });
 };
 
-OnlyKey.prototype.listenforvalue = async function (succeed_msg) {
-  await listenForMessageIncludes2("Error", succeed_msg).catch(error => {
-    throw error;
+/* Kept for API compatibility; nothing in the App calls it now. Resolves on the
+ * next message, as listenForMessageIncludes2 did on the desktop. */
+OnlyKey.prototype.listenforvalue = function (succeed_msg) {
+  return new Promise((resolve, reject) => {
+    this.listen((err, msg) => (err ? reject(err) : resolve(msg)));
   });
 };
 
+/*
+ * The next report, once. Kept for API compatibility: it used to arm a
+ * chrome.hid.receive, and now takes the next report from the one reader
+ * instead (onVendorReport), so it can never become a second reader.
+ */
 OnlyKey.prototype.listen = function (callback) {
-  pollForInput({}, callback);
+  oneShotListeners.push(typeof callback === "function" ? callback : handleMessage);
 };
+
+/*
+ * SET TIME = the lib's device.connect().
+ *
+ * OKSETTIME and OKCONNECT are the same message (0xE4) and carry the time at
+ * the same offset; the lib's also carries a transit public key, which the
+ * vendor path ignores (plugins/session connect). The device answers with its
+ * status - UNINITIALIZEDv..., INITIALIZED[-D], UNLOCKEDv..., BOOTLOADER.
+ *
+ * The callback gets (null, status) - the reply the old code read after
+ * sending. It used to be sent TWICE ("fixes issue where when attaching
+ * OnlyKey to a VM response is not received"); the lib waits for an answer, so
+ * the second send is now a retry that only happens when the first goes
+ * unanswered, which is the case it existed for.
+ *
+ * Fire-and-forget like the old one (it returned before the reply), and
+ * coalesced: a setTime asked for while one is in flight gets that one's
+ * answer. The config-mode path in onVendorReport asks for one per status
+ * report, and without this each answer would start another connect.
+ */
+let setTimeWaiters = null;
 
 OnlyKey.prototype.setTime = async function (callback) {
-  var currentEpochTime = Math.round(new Date().getTime() / 1000.0).toString(16);
-  console.info("Setting current epoch time =", currentEpochTime);
-  var timeParts = currentEpochTime.match(/.{2}/g);
-  // Send OKSETTIME Twice, fixes issue where when attaching OnlyKey to a VM response is not received
-  // Also clear out any rogue messages from other apps
-  var options = {
-    contents: timeParts,
-    msgId: "OKSETTIME",
-  };
-  this.sendMessage(options, this.sendMessage(options, callback));
+  const cb = typeof callback === "function" ? callback : handleMessage;
+  if (setTimeWaiters) {
+    setTimeWaiters.push(cb);
+    return;
+  }
+  setTimeWaiters = [cb];
+  console.info("Setting current epoch time =", Math.round(Date.now() / 1000.0).toString(16));
+
+  libOp("OKSETTIME", async (device) => {
+    try {
+      return await device.connect();
+    } catch (first) {
+      console.warn("OKSETTIME got no answer, sending it again:", errorText(first));
+      return device.connect();
+    }
+  }).then(
+    (result) => {
+      const waiters = setTimeWaiters || [];
+      setTimeWaiters = null;
+      waiters.forEach((fn) => fn(null, (result && result.status) || ""));
+    },
+    (err) => {
+      const waiters = setTimeWaiters || [];
+      setTimeWaiters = null;
+      console.error("ERROR SENDING OKSETTIME:", errorText(err));
+      waiters.forEach((fn) => fn("ERROR SENDING PACKETS"));
+    }
+  );
 };
 
+/*
+ * LABELS = the lib's device.readLabels().
+ *
+ * It sends OKGETLABELS and collects the device's `NN|label` reports itself,
+ * skipping status broadcasts, and ends on the last slot of the model - which
+ * is why the model is handed over first: 12 on a classic, 24 on a DUO. The
+ * old handleGetLabels did the same collecting by re-listening once per label.
+ *
+ * The 900 ms wait is kept: getLabels is called straight after setTime, and
+ * the old code waited for that exchange to finish before asking.
+ */
 OnlyKey.prototype.getLabels = async function () {
   this.labels = "";
   await wait(900);
-  this.sendMessage({ msgId: "OKGETLABELS" }, handleGetLabels);
+  const appType = this.getDeviceType();
+  const libType =
+    appType === DEVICE_TYPES.DUO ? "duo" : appType === DEVICE_TYPES.CLASSIC ? "classic" : null;
+
+  try {
+    const out = await libOp("OKGETLABELS", (device) => {
+      device.setDeviceType(libType);
+      return device.readLabels();
+    });
+    this.labels = out.labels;
+    initSlotConfigForm();
+  } catch (err) {
+    const text = errorText(err);
+    this.labels = (err && err.partial && err.partial.labels) || [];
+    if (text.includes("Error not in config mode")) {
+      this.setLastMessage("received", "Error not in config mode");
+    } else {
+      console.warn("Reading labels failed:", text);
+    }
+    if (this.labels.some((label) => label !== null && label !== undefined)) {
+      initSlotConfigForm();
+    }
+  }
 };
 
-function handleGetLabels(err, msg) {
-  msg = typeof msg === "string" ? msg.trim() : "";
-  console.info(`HandleGetLabels msg: ${msg}`);
-  if (myOnlyKey.getLastMessage("sent") !== "OKGETLABELS") {
-    return;
-  }
-
-  if (myOnlyKey.labels === "") {
-    myOnlyKey.labels = [];
-    return myOnlyKey.listen(handleGetLabels);
-  }
-
-  // if second char of response is a pipe, theses are labels
-  const msgParts = msg.split("|");
-  let slotNum = msgParts[0];
-  switch (slotNum) {
-    case '1a': slotNum = 20; break;
-    case '1b': slotNum = 21; break;
-    case '1c': slotNum = 22; break;
-    case '1d': slotNum = 23; break;
-    case '1e': slotNum = 24; break;
-    default: slotNum = parseInt(slotNum, 10); break;
-  }
-
-  if (
-    msg.includes("Error not in config mode") ||
-    myOnlyKey.getLastMessage("received") == "Error not in config mode"
-  ) {
-    myOnlyKey.setLastMessage("received", "Error not in config mode");
-  } else if (msg.indexOf("|") !== 2 || typeof slotNum !== "number" || slotNum < 1 || slotNum > 24) {
-    myOnlyKey.listen(handleGetLabels);
-  } else {
-    myOnlyKey.labels[slotNum - 1] = msgParts[1];
-    initSlotConfigForm();
-    if (myOnlyKey.getDeviceType() === DEVICE_TYPES.DUO) {
-      if (slotNum < 24 && (msg.indexOf("|") == 2 || msg.indexOf("|") == 3)) {
-        myOnlyKey.listen(handleGetLabels);
-      }
-    } else {
-      if (slotNum < 12 && (msg.indexOf("|") == 2 || msg.indexOf("|") == 3)) {
-        myOnlyKey.listen(handleGetLabels);
-      }
-    }
-  }
-}
-
-OnlyKey.prototype.sendPinMessage = function ({ msgId="", pin="", poll=true }, callback=()=>{}) {
-  this.pendingMessages[msgId] = !this.pendingMessages[msgId];
-  var cb = poll ? pollForInput.bind(this, {}, callback) : callback;
+/*
+ * ONE STEP OF THE CLASSIC PIN BRACKET = the lib's device.pinStep().
+ *
+ * THE MAPPING (risk 2 in the port plan). The wizard drives the bracket from
+ * its steps - it has always been the thing deciding when each message goes,
+ * because the person presses the key's buttons in between:
+ *
+ *   wizard                              count  lib pinStep   device answers
+ *   Step2 enterFn  flush, sendSetPin    0->1   'armed'       "OnlyKey is ready, enter your PIN"
+ *     (person presses the PIN on the key)
+ *   Step2 exitFn   sendSetPin           1->2   'stored'      "Successful PIN entry"
+ *   Step3 enterFn  sendSetPin           2->3   'confirming'  "...ready, re-enter your PIN to confirm"
+ *     (person presses it again)
+ *   Step3 exitFn   sendSetPin           3->0   'matched'     "Successfully set PIN"
+ *
+ * and the same for OKSETPIN2 (Steps 4/5, kind 'secondary') and OKSETSDPIN
+ * (Steps 6/7, kind 'selfDestruct'). The count is the firmware's own
+ * `pin_set`; the lib's 'committed' step is not run because the wire has
+ * nothing more to say after "Successfully set PIN" and its console wait would
+ * only time out on a release build.
+ *
+ * A REFUSAL - "Error PIN is not between 7 - 10 digits" at 'stored', or at
+ * 'matched' a mismatch - sends the firmware back to 0, so the count goes to 0
+ * too, and the callback gets (message, msgId) exactly as pollForInput gave it,
+ * which is what the wizard's goBackOnError switches on to return to Step2 / 4
+ * / 6. Any other "Error ..." (not in config mode, locked) ends the step at
+ * once as it did before - the lib's pinStep only knows the two PIN refusals
+ * and would otherwise wait out its timeout (docs/LIB-PORT.md, lib gaps) - and
+ * leaves the count alone, because the firmware never took the message.
+ *
+ * The DUO has no bracket: its PINs travel in the message (sendPin_DUO).
+ */
+OnlyKey.prototype.sendPinMessage = function ({ msgId = "", pin = "", poll = true }, callback = () => {}) {
   console.info(`sendPinMessage ${msgId}`);
-  const messageParams = {
-    msgId,
-  };
 
-  if (myOnlyKey.getLastMessage("received") == "Error PIN is not between 7 - 10 digits") {
-    this.setLastMessage("received", "Canceled");
-    messageParams.msgId = "OKSETPIN";
-    messageParams.poll = false;
+  if (this.getDeviceType() === DEVICE_TYPES.DUO) {
+    /*
+     * Not sent. On a DUO this only ever carried the PIN bytes for sendPin_DUO,
+     * which now goes to the lib's duoPin() directly. The one other way here was
+     * flushMessage, which on a DUO sent an EMPTY PIN message (the toggle below
+     * was shared with the classic bracket), and a DUO has nothing to flush.
+     */
+    this.pendingMessages[msgId] = false;
+    return callback(null, this.getLastMessage("received"));
   }
 
-  if (
-    myOnlyKey.getLastMessage("received").includes("UNLOCKED") ||
-    myOnlyKey.getLastMessage("received").includes("INITIALIZED")
-  ) {
-    cb = pollForInput.bind(this, {}, cb);
-  }
+  const kind = okLibPipe && okLibPipe.PIN_KIND[msgId];
+  if (!kind) return callback(`unknown PIN message ${msgId}`, msgId);
 
-  const deviceType = myOnlyKey.getDeviceType();
-  if (deviceType === DEVICE_TYPES.DUO) {
-    messageParams.contents = pin;
-    messageParams.contentType = "DEC";
-    if (myOnlyKey.isLocked == true && myOnlyKey.isInitialized == true) {
-      messageParams.poll = true;
-      cb = callback;
+  const at = this.pinSteps[msgId] || 0;
+  const label = okLibPipe.PIN_STEPS[at];
+
+  let unwatch = () => {};
+  const refused = new Promise((resolve, reject) => {
+    pinErrorWatch = (msg) => reject(new Error(msg));
+    unwatch = () => {
+      pinErrorWatch = null;
+    };
+  });
+  const step = libOp(msgId, (device) => device.pinStep(label, { kind }));
+  step.catch(() => {}); /* may lose the race below; its rejection is expected then */
+
+  Promise.race([step, refused]).then(
+    () => {
+      unwatch();
+      this.pinSteps[msgId] = (at + 1) % okLibPipe.PIN_STEPS.length;
+      this.pendingMessages[msgId] = this.pinSteps[msgId] % 2 === 1;
+      callback(null, this.getLastMessage("received"));
+    },
+    (err) => {
+      unwatch();
+      const text = errorText(err);
+      if (/PIN is not between|PINs Don'?t Match/i.test(text)) {
+        this.pinSteps[msgId] = 0;
+        this.pendingMessages[msgId] = false;
+      } else if (!/^Error/i.test(text)) {
+        reportLibError(err);
+      }
+      callback(text, msgId);
     }
-  }
-  this.sendMessage(messageParams, cb);
+  );
 };
 
 OnlyKey.prototype.sendSetPin = function (callback) {
@@ -561,74 +772,118 @@ OnlyKey.prototype.sendSetPin2 = function (callback) {
   this.sendPinMessage({ msgId: "OKSETPIN2" }, callback);
 };
 
+/*
+ * DUO PINs = the lib's device.duoPin().
+ *
+ * One message either way: `setpin` true carries every PIN, 16 bytes each,
+ * behind a 0xFF (setting them); false carries one PIN (an unlock attempt).
+ * The lib builds the same bytes the old loop did (src/device/pin.js
+ * encodeDuoPins) and returns the device's first answer.
+ *
+ * The dialog logic below is unchanged and still reads the LAST RECEIVED
+ * message; it now runs after the answer instead of 100 ms after the send, so
+ * it judges the attempt that was just made. On a locked key the answer is also
+ * handed to handleMessage, where the old always-armed handleMessage loop took
+ * it: that is how UNLOCKED... reaches the unlock path.
+ */
 OnlyKey.prototype.sendPin_DUO = function (pins, setpin, callback) {
-  // if only 1 pin is sent, just send those pin chars as a login attempt
-  // otherwise, concatenate all PINs sent and fill with null (hex 0)
-  const pinCount = pins.length;
-  const bytesPerPin = 16;
-  const pinBytesLength = pinCount === 1 ? pins[0].length : pinCount * bytesPerPin;
-  let pinBytes = new Array(pinBytesLength).fill(0);
-  pins.forEach((pin, i) => {
-    if (typeof pin !== "string") pin = "";
-    // PIN chars should only be ascii 1-7
-    // add 48 to send as DEC
-    pin
-      .split("")
-      .forEach((char, j) => (pinBytes[i * 16 + j] = 48 + Number(char)));
-  });
-  if (setpin==true) {
-    pinBytes.unshift(255); 
-  } 
-  this.sendPinMessage({ msgId: "OKSETPIN", pin: pinBytes }, async function () {
-    const msgReceived = myOnlyKey.getLastMessage("received");
-    console.info(`sendPin_DUO last message received: ${msgReceived}`);
+  const unlocking = this.isLocked == true && this.isInitialized == true;
+  libOp("OKSETPIN", (device) => device.duoPin(pins, { set: setpin == true })).then(
+    (reply) => {
+      const msgReceived = myOnlyKey.getLastMessage("received");
+      console.info(`sendPin_DUO last message received: ${msgReceived}`);
 
-    // Check if PIN attempts exceeded
-    if (msgReceived.indexOf("Error password attempts for this session exceeded") === 0) {
-      // max pin attempts dialog
-      document.getElementById("locked-text-duo").classList.add("hide");
-      document.getElementById("max-pin-attempts-duo").classList.remove("hide");
-      document.getElementById("incorrect-pin-duo").classList.add("hide");
-      console.info("PIN attempts exeeded");
-    } else if (msgReceived.indexOf("INITIALIZED-D") === 0) {
-      // incorrect pin dialog
-      document.getElementById("locked-text-duo").classList.remove("hide");
-      document.getElementById("max-pin-attempts-duo").classList.add("hide");
-      setTimeout(function() {
-        document.getElementById("incorrect-pin-duo").classList.remove("hide");
-      }, 2000); 
-      console.info("Incorrect PIN attempt");
-    } else {
-      // normal PIN dialog
-      document.getElementById("locked-text-duo").classList.remove("hide");
-      document.getElementById("max-pin-attempts-duo").classList.add("hide");
-      document.getElementById("incorrect-pin-duo").classList.add("hide");
-    }
-    return callback();
-  });
+      // Check if PIN attempts exceeded
+      if (msgReceived.indexOf("Error password attempts for this session exceeded") === 0) {
+        // max pin attempts dialog
+        document.getElementById("locked-text-duo").classList.add("hide");
+        document.getElementById("max-pin-attempts-duo").classList.remove("hide");
+        document.getElementById("incorrect-pin-duo").classList.add("hide");
+        console.info("PIN attempts exeeded");
+      } else if (msgReceived.indexOf("INITIALIZED-D") === 0) {
+        // incorrect pin dialog
+        document.getElementById("locked-text-duo").classList.remove("hide");
+        document.getElementById("max-pin-attempts-duo").classList.add("hide");
+        setTimeout(function() {
+          document.getElementById("incorrect-pin-duo").classList.remove("hide");
+        }, 2000);
+        console.info("Incorrect PIN attempt");
+      } else {
+        // normal PIN dialog
+        document.getElementById("locked-text-duo").classList.remove("hide");
+        document.getElementById("max-pin-attempts-duo").classList.add("hide");
+        document.getElementById("incorrect-pin-duo").classList.add("hide");
+      }
+      if (unlocking) {
+        const text = readBytes(new Uint8Array(Array.from(reply || [])));
+        if (text) routeToHandleMessage(text);
+      }
+      return callback();
+    },
+    (err) => callback(reportLibError(err))
+  );
 };
 
+/*
+ * ONE SLOT FIELD = the lib's device.setSlot(slot, {field: value}).
+ *
+ * The wizard writes a slot one field at a time and moves to the next field
+ * from this callback (OnlyKeyWizard.js setSlot), so the signature is kept.
+ * The difference is WHEN the callback runs: it used to run 100 ms after the
+ * send, with the device's answer left unread; now it runs on the answer, so
+ * "Error ..." reaches the wizard as an error instead of being skipped over.
+ * The lib retries a write the device did not answer at all, which the
+ * firmware tolerates because each field write is a complete store.
+ *
+ * Slot "XX" (0) carries the device-wide settings; those go to setPreference.
+ */
 OnlyKey.prototype.setSlot = function (slotArg, field, value, callback) {
   let slot = slotArg || this.getSlotNum();
   if (typeof slot !== "number") slot = this.getSlotNum(slot);
-  var options = {
-    contents: value,
-    msgId: "OKSETSLOT",
-    slotId: slot,
-    fieldId: field,
-  };
-  this.sendMessage(options, callback);
+  const done = typeof callback === "function" ? callback : () => {};
+
+  if (slot === 0 && okLibPipe && okLibPipe.PREFERENCE[field]) {
+    return setPreferenceField(field, value, done);
+  }
+
+  const name = okLibPipe && okLibPipe.SLOT_FIELD[field];
+  if (!name) {
+    console.warn(`setSlot: no lib field for ${field}; sending the raw frame`);
+    return this.sendMessage(
+      { contents: value, msgId: "OKSETSLOT", slotId: slot, fieldId: field },
+      done
+    );
+  }
+
+  let fieldValue;
+  try {
+    fieldValue = okLibPipe.slotValue(field, value);
+  } catch (err) {
+    return done(reportLibError(err));
+  }
+
+  return libOp("OKSETSLOT", (device) => device.setSlot(slot, { [name]: fieldValue })).then(
+    (applied) => done(null, applied.length ? applied[applied.length - 1].response : "OK"),
+    (err) => done(reportLibError(err))
+  );
 };
 
+/*
+ * WIPE A SLOT = the lib's device.wipeSlot(). The callback runs on the device's
+ * first "Successfully wiped ..." (the firmware sends one per field; the rest
+ * arrive afterwards and are recorded like any other message).
+ */
 OnlyKey.prototype.wipeSlot = function (slotArg, field, callback) {
   let slot = slotArg || this.getSlotNum();
   if (typeof slot !== "number") slot = this.getSlotNum(slot);
-  const options = {
-    msgId: "OKWIPESLOT",
-    slotId: slot,
-    fieldId: field || null,
-  };
-  this.sendMessage(options, callback);
+  const done = typeof callback === "function" ? callback : () => {};
+  const name = field ? okLibPipe && okLibPipe.SLOT_FIELD[field] : null;
+  if (field && !name) return done(`wipeSlot: unknown field ${field}`);
+
+  return libOp("OKWIPESLOT", (device) => device.wipeSlot(slot, name)).then(
+    (text) => done(null, text),
+    (err) => done(reportLibError(err))
+  );
 };
 
 OnlyKey.prototype.getSlotNum = function (slotIdArg) {
@@ -639,11 +894,11 @@ OnlyKey.prototype.getSlotNum = function (slotIdArg) {
   } else if (this.getDeviceType() === DEVICE_TYPES.DUO) {
     if (parseInt(slotId, 10) <= 3) {
     slotNum = parseInt(slotId, 10) + (slotId.match(/a|b/)[0] === 'a' ? 0 : 3);
-    } else if (parseInt(slotId, 10) <= 6) { 
+    } else if (parseInt(slotId, 10) <= 6) {
       slotNum = parseInt(slotId, 10) + (slotId.match(/a|b/)[0] === 'a' ? 3 : 6);
-    } else if (parseInt(slotId, 10) <= 9) { 
+    } else if (parseInt(slotId, 10) <= 9) {
       slotNum = parseInt(slotId, 10) + (slotId.match(/a|b/)[0] === 'a' ? 6 : 9);
-    } else if (parseInt(slotId, 10) <= 12) { 
+    } else if (parseInt(slotId, 10) <= 12) {
       slotNum = parseInt(slotId, 10) + (slotId.match(/a|b/)[0] === 'a' ? 9 : 12);
     }
   } else {
@@ -652,27 +907,37 @@ OnlyKey.prototype.getSlotNum = function (slotIdArg) {
   return slotNum;
 };
 
+/*
+ * THE DEVICE-GLOBAL YUBICO CREDENTIAL = the lib's device.setYubiAuth().
+ * publicId arrives as hex - submitYubiAuthForm converts the typed modhex -
+ * which is what the lib wants for the global slot. The lib validates first
+ * (exactly 6/6/16 bytes) and sends nothing if a field is wrong; that reason is
+ * shown as the last message. The callback still runs either way, as it did.
+ */
 OnlyKey.prototype.setYubiAuth = function (
   publicId,
   privateId,
   secretKey,
   callback
 ) {
-  this.setSlot(
-    "XX",
-    "YUBIAUTH",
-    (publicId + privateId + secretKey).match(/.{2}/g),
-    async () => {
-      await this.listenforvalue("set AES Key");
-      return callback();
-    }
+  const done = typeof callback === "function" ? callback : () => {};
+  libOp("OKSETSLOT", (device) => device.setYubiAuth({ publicId, privateId, secretKey })).then(
+    () => done(),
+    (err) => done(reportLibError(err))
   );
 };
 
+/*
+ * LIB GAP - there is no lib method for this, and the lib's wipeSlot cannot
+ * stand in: the firmware wipes the global credential SILENTLY (okcore.cpp
+ * wipe_slot, `value == 10 && slot == 0` has no hidprint), and wipeSlot waits
+ * for an acknowledgement. So this is the App's own raw frame, sent through the
+ * lib's transport. The old code then waited for "wiped AES Key", which never
+ * comes; this calls back once the frame is out.
+ */
 OnlyKey.prototype.wipeYubiAuth = function (callback) {
-  this.wipeSlot("XX", "YUBIAUTH", async () => {
-    await this.listenforvalue("wiped AES Key");
-    return callback();
+  this.sendMessage({ msgId: "OKWIPESLOT", slotId: 0, fieldId: "YUBIAUTH" }, (err) => {
+    if (typeof callback === "function") callback(err);
   });
 };
 
@@ -723,26 +988,33 @@ OnlyKey.prototype.setRSABackupKey = async function (key, passcode, cb) {
   });
 };
 
+/*
+ * BACKUP PASSPHRASE = the lib's device.setBackupPassphrase().
+ *
+ * The lib derives the key the way this did - SHA-256 of the passphrase into
+ * slot 131 as type 161 (src/device/keys.js backupKeyFromPassphrase) - and
+ * waits for the device's answer, resending once if there is none.
+ *
+ * The callback keeps the old contract: it ran once the device said ANYTHING
+ * ("Success..." or "Error not in config mode" alike, listenForMessageIncludes2)
+ * with no error, so the wizard moved on either way and the message list said
+ * which. A device refusal therefore still calls back clean; only no answer at
+ * all, or a passphrase the lib refuses before sending, is an error now.
+ */
 OnlyKey.prototype.setBackupPassphrase = async function (passphrase, cb) {
-  // abcdefghijklmnopqrstuvwxyz
-  let key, type, slot;
-  try {
-    key = await Array.from(openpgp.crypto.hash.digest(8, passphrase)); // 32 byte backup key is Sha256 hash of passphrase
-    type = 161; //Backup and Decryption key
-    slot = 131;
-  } catch (e) {
-    return cb(e);
-  }
-
-  this.setPrivateKey(slot, type, key, async function (err) {
-    onlyKeyConfigWizard.initForm.reset();
-    await wait(300);
-    await listenForMessageIncludes2(
-      "Error not in config mode",
-      "Success"
-    );
-    cb(err);
-  });
+  const done = typeof cb === "function" ? cb : () => {};
+  libOp("OKSETPRIV", (device) => device.setBackupPassphrase(passphrase)).then(
+    () => {
+      onlyKeyConfigWizard.initForm.reset();
+      done(null);
+    },
+    (err) => {
+      onlyKeyConfigWizard.initForm.reset();
+      const text = errorText(err);
+      if (/: Error/i.test(text)) return done(null);
+      done(reportLibError(err));
+    }
+  );
 };
 
 OnlyKey.prototype.submitFirmware = function (fileSelector, cb) {
@@ -766,13 +1038,8 @@ OnlyKey.prototype.submitFirmware = function (fileSelector, cb) {
           onlyKeyConfigWizard.newFirmware = contents;
           if (!myOnlyKey.isBootloader) {
             console.info("Working... Do not remove OnlyKey");
-
-            const temparray = "1234";
-            submitFirmwareData(temparray, function (err) {
-              //First send one message to kick OnlyKey (in config mode) into bootloader
-              console.info("Firmware file sent to OnlyKey");
-              myOnlyKey.listen(handleMessage); //OnlyKey will respond with "SUCCESSFULL FW LOAD REQUEST, REBOOTING..." or "ERROR NOT IN CONFIG MODE"
-            });
+            //First send one message to kick OnlyKey (in config mode) into bootloader
+            requestFirmwareLoad(() => console.info("Firmware file sent to OnlyKey"));
           } else {
             await loadFirmware();
           }
@@ -789,6 +1056,21 @@ OnlyKey.prototype.submitFirmware = function (fileSelector, cb) {
   }
 };
 
+/*
+ * RESTORE = the lib's device.restore(), which checks the file's rolling
+ * SHA-256 before a byte goes out and then sends it in the same OKRESTORE
+ * packets this used to. Two differences, both deliberate:
+ *
+ *   - a file whose digest is present and WRONG is refused (the lib always
+ *     refuses it); the App used to send it anyway
+ *   - a file with NO digest line (firmware before v2.1.2) is sent, as the App
+ *     always did - `unverifiable: true` is that decision, made here once
+ *
+ * The no-file path is NOT a restore: the wizard's Exit on the restore step
+ * sends it to make the key restart ("Reboot Requested", OnlyKeyWizard.js).
+ * The lib has nothing for that, so it is the App's own frame, byte for byte
+ * (see submitRestoreData) - docs/LIB-PORT.md, lib gaps.
+ */
 OnlyKey.prototype.submitRestore = function (fileSelector, cbArg) {
   const cb = typeof cbArg === "function" ? cbArg : () => {};
   const _this = this;
@@ -800,9 +1082,10 @@ OnlyKey.prototype.submitRestore = function (fileSelector, cbArg) {
 
     reader.onload = (function (theFile) {
       return function (e) {
-        var contents = e.target && e.target.result && e.target.result.trim();
+        const text = e.target && e.target.result && e.target.result.trim();
+        var contents;
         try {
-          contents = parseBackupData(contents);
+          contents = parseBackupData(text);
         } catch (parseError) {
           const error = "Could not parse backup file.";
           _this.setLastMessage("received", error);
@@ -814,17 +1097,18 @@ OnlyKey.prototype.submitRestore = function (fileSelector, cbArg) {
           step10text.innerHTML =
             "Restoring from backup please wait...<br><br>" +
             "<img src='/images/Pacman-0.8s-200px.gif' height='40' width='40'><br><br>";
-          submitRestoreData(contents, async function (err) {
-            if (err) {
-              _this.setLastMessage("received", error);
-              throw Error(error);
+          libOp("OKRESTORE", (device) => device.restore(text, { unverifiable: true })).then(
+            async () => {
+              _this.setLastMessage("received", "Backup file sent to OnlyKey, please wait...");
+              await wait(10000);
+              step10text.innerHTML = "";
+              cb();
+            },
+            (err) => {
+              step10text.innerHTML = "";
+              reportLibError(err);
             }
-
-            _this.setLastMessage("received", "Backup file sent to OnlyKey, please wait...");
-            await wait(10000);
-            step10text.innerHTML = "";
-            cb();
-          });
+          );
         } else {
           const error = "Incorrect backup data format.";
           _this.setLastMessage("received", error);
@@ -839,8 +1123,8 @@ OnlyKey.prototype.submitRestore = function (fileSelector, cbArg) {
     var contents = "000000000";
     submitRestoreData(contents, function (err) {
       if (err) {
-        _this.setLastMessage("received", error);
-        throw Error(error);
+        _this.setLastMessage("received", err);
+        throw Error(err);
       }
 
       _this.setLastMessage("received", "Backup file sent to OnlyKey.");
@@ -849,35 +1133,45 @@ OnlyKey.prototype.submitRestore = function (fileSelector, cbArg) {
   }
 };
 
+/*
+ * A PRIVATE KEY = the lib's device.loadKey(slot, {type, key}).
+ *
+ * `type` is the App's byte - algorithm plus the backup/signature/decryption
+ * modifier bits - passed through unchanged. The lib sends a key that fits one
+ * report as one frame, and a longer (RSA) key as the same 57-byte OKSETPRIV
+ * chunks submitRsaKey used to, then waits for "Successfully set ... Key".
+ * The callback gets that answer as its message.
+ */
 OnlyKey.prototype.setPrivateKey = async function (slot, type, key, callback) {
-  var msg, contentType;
-  if (Array.isArray(key) || key.constructor === Uint8Array) {
-    // RSA private key is an array of DEC bytes
-    contentType = "DEC";
-    msg = key;
-  } else {
-    // private key strings should be pairs of HEX bytes
-    msg = key.match(/.{2}/g);
-  }
+  const done = typeof callback === "function" ? callback : () => {};
+  const bytes =
+    Array.isArray(key) || (key && typeof key !== "string" && typeof key.length === "number")
+      ? Array.from(key)
+      : okLibPipe.hexToByteArray(key); // private key strings are pairs of HEX bytes
 
-  var options = {
-    contents: msg,
-    msgId: "OKSETPRIV",
-    slotId: slot,
-    fieldId: type,
-    contentType: contentType,
-  };
-  this.sendMessage(options, callback);
+  return libOp("OKSETPRIV", (device) => device.loadKey(slot, { type, key: bytes })).then(
+    () => done(null, myOnlyKey.getLastMessage("received")),
+    (err) => done(reportLibError(err))
+  );
 };
 
+/*
+ * WIPE A KEY SLOT = the lib's device.wipeKey(). keepLabel, because the lib
+ * would otherwise also blank the slot's key label - a second write this App
+ * never made, into label indices older firmware does not have.
+ */
 OnlyKey.prototype.wipePrivateKey = function (slot, callback) {
-  var options = {
-    msgId: "OKWIPEPRIV",
-    slotId: slot,
-  };
-  this.sendMessage(options, callback);
+  const done = typeof callback === "function" ? callback : () => {};
+  return libOp("OKWIPEPRIV", (device) => device.wipeKey(slot, { keepLabel: true })).then(
+    (result) => done(null, result.response),
+    (err) => done(reportLibError(err))
+  );
 };
 
+/*
+ * One raw OKRESTORE packet. Only the no-file "reboot" of submitRestore still
+ * builds one (see there); a real backup goes through the lib's restore().
+ */
 OnlyKey.prototype.restore = async function (
   restoreData,
   packetHeader,
@@ -892,35 +1186,40 @@ OnlyKey.prototype.restore = async function (
   this.sendMessage(options, callback);
 };
 
-OnlyKey.prototype.firmware = async function (
-  firmwareData,
-  packetHeader,
-  callback
-) {
-  var msg = [packetHeader];
-  msg = msg.concat(firmwareData.match(/.{2}/g));
-  var options = {
-    contents: msg,
-    msgId: "OKFWUPDATE",
-  };
-  console.info("OKFWUPDATE message sent ");
-  console.info(options);
-  this.sendMessage(options, callback);
-};
+/*
+ * THE DEVICE-WIDE SETTINGS = the lib's device.setPreference(name, value).
+ *
+ * Every one is OKSETSLOT on slot 0 with one byte, and the lib's table
+ * (plugins/device PREFERENCES) knows each field's range and which firmware has
+ * it, and waits for the "Successfully set ..." answer. These used to wait for
+ * ANY next message (listenforvalue); they now wait for the answer itself.
+ */
+function setPreferenceField(field, value, callback) {
+  const done = typeof callback === "function" ? callback : () => {};
+  const name = okLibPipe && okLibPipe.PREFERENCE[field];
+  if (!name) return Promise.resolve(done(`no preference for ${field}`));
+  return libOp("OKSETSLOT", (device) => device.setPreference(name, value)).then(
+    (result) => done(null, result.response),
+    (err) => done(reportLibError(err))
+  );
+}
 
 OnlyKey.prototype.setLockout = function (lockout, callback) {
-  this.setSlot("XX", "LOCKOUT", lockout, async () => {
-    await this.listenforvalue("set idle timeout");
-    return callback();
-  });
+  setPreferenceField("LOCKOUT", lockout, () => callback());
 };
 
 OnlyKey.prototype.setWipeMode = function (wipeMode) {
-  this.setSlot("XX", "WIPEMODE", wipeMode, async () => {
-    return await this.listenforvalue("set Wipe Mode");
-  });
+  return setPreferenceField("WIPEMODE", wipeMode);
 };
 
+/*
+ * LIB GAP - left as the App's raw frame. On first use the firmware takes the
+ * second-profile mode SILENTLY (okcore.cpp set_slot case 23: its hidprint is
+ * commented out) and refuses it later with a sentence that does not begin
+ * "Error", so the lib's setPreference('secProfileMode') would wait out three
+ * 10 s attempts on exactly the path the wizard uses - mid PIN bracket, Step4.
+ * The old behaviour, a send and a callback, is the one that works.
+ */
 OnlyKey.prototype.setSecProfileMode = function (secProfileMode, callback) {
   secProfileMode = parseInt(secProfileMode, 10);
   var options = {
@@ -933,76 +1232,53 @@ OnlyKey.prototype.setSecProfileMode = function (secProfileMode, callback) {
 };
 
 OnlyKey.prototype.setderivedchallengeMode = function (derivedchallengeMode) {
-  this.setSlot("XX", "derivedchallengeMode", derivedchallengeMode, async () => {
-    return await this.listenforvalue("challenge mode");
-  });
+  return setPreferenceField("derivedchallengeMode", derivedchallengeMode);
 };
 
 OnlyKey.prototype.setstoredchallengeMode = function (storedchallengeMode) {
-  this.setSlot("XX", "storedchallengeMode", storedchallengeMode, async () => {
-    return await this.listenforvalue("challenge mode");
-  });
+  return setPreferenceField("storedchallengeMode", storedchallengeMode);
 };
 
 OnlyKey.prototype.setwebAgentDeriveMode = function (webAgentDeriveMode) {
-  this.setSlot("XX", "webAgentDeriveMode", webAgentDeriveMode, async () => {
-    return await this.listenforvalue("web and agent derived key mode");
-  });
+  return setPreferenceField("webAgentDeriveMode", webAgentDeriveMode);
 };
 
 OnlyKey.prototype.setwebcryptPolicy = function (webcryptPolicy) {
-  this.setSlot("XX", "webcryptPolicy", webcryptPolicy, async () => {
-    return await this.listenforvalue("webcrypt policy");
-  });
+  return setPreferenceField("webcryptPolicy", webcryptPolicy);
 };
 
 OnlyKey.prototype.sethmacchallengeMode = function (hmacchallengeMode) {
-  this.setSlot("XX", "hmacchallengeMode", hmacchallengeMode, async () => {
-    return await this.listenforvalue("HMAC Challenge Mode");
-  });
+  return setPreferenceField("hmacchallengeMode", hmacchallengeMode);
 };
 
 OnlyKey.prototype.setmodkeyMode = function (modkeyMode) {
-  this.setSlot("XX", "modkeyMode", modkeyMode, async () => {
-    return await this.listenforvalue("Sysadmin Mode");
-  });
+  return setPreferenceField("modkeyMode", modkeyMode);
 };
 
 OnlyKey.prototype.setbackupKeyMode = function (backupKeyMode) {
   backupKeyMode = parseInt(backupKeyMode, 10);
-  this.setSlot("XX", "BACKUPKEYMODE", backupKeyMode,  async () => {
-    return await this.listenforvalue("set Backup Key Mode");
-  });
+  return setPreferenceField("BACKUPKEYMODE", backupKeyMode);
 };
 
 OnlyKey.prototype.setTypeSpeed = function (typeSpeed) {
-  this.setSlot("XX", "TYPESPEED", typeSpeed, async () => {
-    return await this.listenforvalue("set keyboard typespeed");
-  });
+  return setPreferenceField("TYPESPEED", typeSpeed);
 };
 
+/* Per slot, so a slot field (lib setSlot typeSpeed), not a preference. */
 OnlyKey.prototype.setSlotTypeSpeed = function (slot, typeSpeed) {
-  this.setSlot(slot, "TYPESPEED", typeSpeed, async () => {
-    return await this.listenforvalue("set keyboard typespeed");
-  });
+  return this.setSlot(slot, "TYPESPEED", typeSpeed);
 };
 
 OnlyKey.prototype.setLedBrightness = function (ledBrightness) {
-  this.setSlot("XX", "LEDBRIGHTNESS", ledBrightness, async () => {
-    return await this.listenforvalue("set LED brightness");
-  });
+  return setPreferenceField("LEDBRIGHTNESS", ledBrightness);
 };
 
 OnlyKey.prototype.setLockButton = function (lockButton) {
-  this.setSlot("XX", "LOCKBUTTON", lockButton, async () => {
-    return await this.listenforvalue("set lock button");
-  });
+  return setPreferenceField("LOCKBUTTON", lockButton);
 };
 
 OnlyKey.prototype.setKBDLayout = function (kbdLayout) {
-  this.setSlot("XX", "KBDLAYOUT", kbdLayout, async () => {
-    return await this.listenforvalue("set keyboard layout");
-  });
+  return setPreferenceField("KBDLAYOUT", kbdLayout);
 };
 
 OnlyKey.prototype.setVersion = function (version) {
@@ -1054,9 +1330,10 @@ OnlyKey.prototype.getDeviceType = function () {
 OnlyKey.prototype.initBootloaderMode = function () {
   this.inBootloader = true;
 
-  loadFirmware(function (err) {
-    myOnlyKey.listen(handleMessage);
-  });
+  /* loadFirmware never called the callback this passed it (it takes none);
+   * what the bootloader says afterwards reaches handleMessage through the
+   * reader regardless. */
+  loadFirmware();
 };
 
 OnlyKey.prototype.setInitialized = function (initializedArg) {
@@ -1271,6 +1548,12 @@ var onDeviceAdded = async function (device) {
   }
 };
 
+/*
+ * CONNECT. Hot-plug stays the App's (risk 4): onDeviceAdded decided which
+ * collection this is, and this opens it - as the lib stack over a chrome.hid
+ * pipe instead of a bare chrome.hid.connect - then does what it always did:
+ * working dialog and wizard init (setConnection), set time, enable the UI.
+ */
 var connectDevice = async function (device) {
   const deviceId = device.deviceId;
 
@@ -1279,33 +1562,73 @@ var connectDevice = async function (device) {
   dialog.close(ui.disconnectedDialog);
   dialog.open(ui.workingDialog);
 
-  chromeHid.connect(deviceId, async function (connectInfo) {
-    if (chrome.runtime.lastError) {
-      console.error("ERROR CONNECTING:", chrome.runtime.lastError);
-    } else if (!connectInfo) {
-      console.warn("Unable to connect to device.");
-    }
+  /* A second matching collection replaces the first, as the old
+   * chromeHid.connect overwrote myOnlyKey.connection. */
+  if (okLib) await closeLib();
 
-    myOnlyKey.setConnection(connectInfo.connectionId);
-    await myOnlyKey.setTime(pollForInput);
-    enableIOControls(true);
-  });
+  try {
+    okLib = await openLib(deviceId);
+  } catch (err) {
+    console.error("ERROR CONNECTING:", err);
+    return;
+  }
+
+  myOnlyKey.setConnection(okLib.pipe.connectionId);
+  myOnlyKey.setTime(handleMessage);
+  enableIOControls(true);
 };
 
-var onDeviceRemoved = function () {
+/** Build the lib stack over this collection and attach the App's reader. */
+async function openLib(deviceId) {
+  if (!okLibPipe) {
+    throw new Error("node-onlykey-lib is not available (it needs NW.js require)");
+  }
+  const pipe = okLibPipe.createChromeHidPipe({
+    chromeHid,
+    deviceId,
+    lastError: () => chrome.runtime.lastError,
+    /* made HERE, in the page's context - see libPipe.js on why */
+    toArrayBuffer: (bytes) => new Uint8Array(bytes).buffer,
+    onReceiveError: (err) => {
+      myOnlyKey.setLastMessage("received", "[error]");
+      handleMessage(err);
+    },
+  });
+  const app = await okLibPipe.composeLibStack({ pipe });
+  const { transport, device } = app.services;
+  /*
+   * Subscribed FIRST, before any lib operation can subscribe, so for every
+   * report the App has recorded it (and counted it as a reply to whatever is
+   * in flight) before the lib's own waiter resolves on it.
+   */
+  const off = transport.on("report", (event) => {
+    if (event.iface === okLibPipe.IFACE.VENDOR) onVendorReport(event.data);
+  });
+  return { app, pipe, transport, device, off };
+}
+
+/** Tear the stack down; stopping the pipe is the chrome.hid.disconnect. */
+async function closeLib() {
+  const lib = okLib;
+  okLib = null;
+  oneShotListeners.length = 0;
+  pinErrorWatch = null;
+  setTimeWaiters = null;
+  if (!lib) return;
+  lib.off();
+  await lib.app.destroy().catch((err) => console.warn("DISCONNECT ERROR:", err));
+}
+
+var onDeviceRemoved = async function () {
   console.info(
     "ONDEVICEREMOVED was triggered with connectionId",
     myOnlyKey.connection
   );
-  if (myOnlyKey.connection === -1) return handleDisconnect();
+  if (myOnlyKey.connection === -1 && !okLib) return handleDisconnect();
 
-  chromeHid.disconnect(myOnlyKey.connection, function () {
-    if (chrome.runtime.lastError) {
-      return console.warn("DISCONNECT ERROR:", chrome.runtime.lastError);
-    }
-    console.info("DISCONNECTED CONNECTION", myOnlyKey.connection);
-    handleDisconnect();
-  });
+  await closeLib();
+  console.info("DISCONNECTED CONNECTION", myOnlyKey.connection);
+  handleDisconnect();
 };
 
 function handleDisconnect() {
@@ -1316,90 +1639,127 @@ function handleDisconnect() {
   enableIOControls(false);
 }
 
-var pollForInput = function (optionsParam, callbackParam) {
-  clearTimeout(myOnlyKey.poll);
+/*
+ * EVERY VENDOR REPORT, from the one reader. This is what pollForInput did to
+ * each message it read, minus the reading:
+ *
+ *   - decode it the App's way (readBytes) and learn the device type from it
+ *   - put it on the last-message list, which is what the UI shows and what
+ *     sendPin_DUO, handleGetLabels and checkForNewFW branch on (risk 1)
+ *   - the version / lock-state bookkeeping for UNINITIALIZED, UNLOCKED and
+ *     INITIALIZED-D, including the DUO config-mode path
+ *   - then hand it on: to a listen() caller if one is waiting, else to
+ *     handleMessage if no lib operation is waiting on it, else to nobody -
+ *     the lib operation that asked for it has it.
+ *
+ * That last rule is decided when the report ARRIVES, and the recording is
+ * done at once; only the bookkeeping and the hand-off are queued, in arrival
+ * order, because the first UNLOCKED waits on a network firmware check
+ * (checkForNewFW) and the old reader did not read on while it did.
+ */
+let reportChain = Promise.resolve();
 
-  const callback =
-    typeof callbackParam === "function" ? callbackParam : handleMessage;
-  const options = optionsParam || {};
-  let msg;
+function onVendorReport(data) {
+  const msg = readBytes(new Uint8Array(Array.from(data)));
+  const listener = oneShotListeners.shift();
+  const route = listener || (libBusy === 0 ? handleMessage : null);
+  const flushing = myOnlyKey.flushing;
+
+  console.info(`RECEIVED: ${msg}\nLast message sent: ${myOnlyKey.getLastMessage('sent')}`);
+  /* The old reader called this on every message and it threw on an empty one. */
+  if (msg) myOnlyKey.setDeviceType(msg);
+
+  if (msg.length > 1 && msg !== "OK" && !flushing) {
+    myOnlyKey.setLastMessage("received", msg);
+  }
+
+  if (pinErrorWatch && (msg.indexOf("Error") === 0 || msg.indexOf("ERROR") === 0)) {
+    pinErrorWatch(msg);
+  }
+
+  /* The lib's capabilities follow the version the key reports once unlocked. */
+  if (okLib && msg.indexOf("UNLOCKED") >= 0) okLib.device.observeStatus(msg);
+
+  reportChain = reportChain
+    .then(() => afterReport(msg, route))
+    .catch((err) => console.error("Handling a device message failed:", err));
+}
+
+async function afterReport(msg, route) {
+  const callback = typeof route === "function" ? route : () => {};
   let version;
 
-  chromeHid.receive(myOnlyKey.connection, async function (reportId, data) {
-    if (chrome.runtime.lastError) {
-      myOnlyKey.setLastMessage("received", "[error]");
-      return callback(chrome.runtime.lastError);
-    } else {
-      msg = readBytes(new Uint8Array(data));
-    }
-
-    console.info(`RECEIVED: ${msg}\nLast message sent: ${myOnlyKey.getLastMessage('sent')}`);
-    myOnlyKey.setDeviceType(msg);
-
-    if (msg.length > 1 && msg !== "OK" && !options.flush) {
-      myOnlyKey.setLastMessage("received", msg);
-    }
-
-    // if message begins with Error, call callback with msg as err
-    // and the last sent message as 2nd arg
-    if (msg.indexOf("Error") === 0 || msg.indexOf("ERROR") === 0) {
-      return callback(msg, myOnlyKey.getLastMessage("sent"));
-    } else if (msg.indexOf("UNINITIALIZEDv") >= 0) {
+  // if message begins with Error, call callback with msg as err
+  // and the last sent message as 2nd arg
+  if (msg.indexOf("Error") === 0 || msg.indexOf("ERROR") === 0) {
+    return callback(msg, myOnlyKey.getLastMessage("sent"));
+  } else if (msg.indexOf("UNINITIALIZEDv") >= 0) {
+    myOnlyKey.fwUpdateSupport = true;
+    version = msg.split("UNINITIALIZED").pop();
+    handleVersion(version);
+    desktopApp &&
+      (await checkForNewFW(
+        userPreferences.autoUpdateFW,
+        myOnlyKey.fwUpdateSupport,
+        version
+      ));
+  } else if (msg.indexOf("UNINITIALIZED") >= 0) {
+    myOnlyKey.fwUpdateSupport = false;
+    version = "v0.2-beta.6";
+    var upgradetext = document.getElementById("upgrade-text");
+    upgradetext.innerHTML =
+      "This application is designed to work with a newer version of OnlyKey firmware. <br>Go to https://docs.crp.to/upgradeguide.html ";
+    handleVersion(version);
+    desktopApp &&
+      (await checkForNewFW(
+        userPreferences.autoUpdateFW,
+        myOnlyKey.fwUpdateSupport,
+        version
+      ));
+    return;
+  } else if (msg.indexOf("UNLOCKED") >= 0) {
+    version = msg.split("UNLOCKED").pop();
+    handleVersion(version);
+    if (version && (version[9] != "." || version[10] > 6)) {
+      //Firmware update through app supported
       myOnlyKey.fwUpdateSupport = true;
-      version = msg.split("UNINITIALIZED").pop();
-      handleVersion(version);
-      desktopApp &&
-        (await checkForNewFW(
-          userPreferences.autoUpdateFW,
-          myOnlyKey.fwUpdateSupport,
-          version
-        ));
-    } else if (msg.indexOf("UNINITIALIZED") >= 0) {
-      myOnlyKey.fwUpdateSupport = false;
-      version = "v0.2-beta.6";
-      var upgradetext = document.getElementById("upgrade-text");
-      upgradetext.innerHTML =
-        "This application is designed to work with a newer version of OnlyKey firmware. <br>Go to https://docs.crp.to/upgradeguide.html ";
-      handleVersion(version);
-      desktopApp &&
-        (await checkForNewFW(
-          userPreferences.autoUpdateFW,
-          myOnlyKey.fwUpdateSupport,
-          version
-        ));
-      return;
-    } else if (msg.indexOf("UNLOCKED") >= 0) {
-      version = msg.split("UNLOCKED").pop();
-      handleVersion(version);
-      if (version && (version[9] != "." || version[10] > 6)) {
-        //Firmware update through app supported
-        myOnlyKey.fwUpdateSupport = true;
-      }
-      desktopApp &&
-        (await checkForNewFW(
-          userPreferences.autoUpdateFW,
-          myOnlyKey.fwUpdateSupport,
-          version
-        ));
-      if (myOnlyKey.isConfigMode == true) {
-        myOnlyKey.isLocked = false;
-        enableIOControls(true);
-      }
-    } else if (msg.indexOf("INITIALIZED-D") >= 0) {
-      if (myOnlyKey.isLocked == false || myOnlyKey.isConfigMode == true) { // Device was unlocked, now its locked, user is putting device in Config Mode
-        myOnlyKey.isLocked = true;
-        myOnlyKey.isConfigMode = true;
-        myOnlyKey.setTime(pollForInput);
-        enableIOControls(true);
-      } else {
-        myOnlyKey.isLocked = true;
-        myOnlyKey.setInitialized(true);
-      }
     }
+    desktopApp &&
+      (await checkForNewFW(
+        userPreferences.autoUpdateFW,
+        myOnlyKey.fwUpdateSupport,
+        version
+      ));
+    if (myOnlyKey.isConfigMode == true) {
+      myOnlyKey.isLocked = false;
+      enableIOControls(true);
+    }
+  } else if (msg.indexOf("INITIALIZED-D") >= 0) {
+    if (myOnlyKey.isLocked == false || myOnlyKey.isConfigMode == true) { // Device was unlocked, now its locked, user is putting device in Config Mode
+      myOnlyKey.isLocked = true;
+      myOnlyKey.isConfigMode = true;
+      myOnlyKey.setTime(handleMessage);
+      enableIOControls(true);
+    } else {
+      myOnlyKey.isLocked = true;
+      myOnlyKey.setInitialized(true);
+    }
+  }
 
-    return await callback(null, msg);
-  });
-};
+  return await callback(null, msg);
+}
+
+/*
+ * A lib reply that the old code would have read into handleMessage - the
+ * answer to a key write that was followed by listen(handleMessage), or a DUO
+ * unlock attempt. Errors go in as errors, the way the reader delivered them.
+ */
+function routeToHandleMessage(msg) {
+  if (msg.indexOf("Error") === 0 || msg.indexOf("ERROR") === 0) {
+    return handleMessage(msg, myOnlyKey.getLastMessage("sent"));
+  }
+  return handleMessage(null, msg);
+}
 
 var readBytes = function (bytes) {
   var msgStr = "";
@@ -1439,7 +1799,9 @@ var handleMessage = async function (err, msg) {
           case "OKSETPIN":
           case "OKSETPIN2":
           case "OKSETSDPIN":
-            return pollForInput();
+            // Ignored mid-bracket. This used to re-arm the reader here; the
+            // reader is continuous now, so returning is all that is left.
+            return;
         }
       }
       break;
@@ -1447,10 +1809,8 @@ var handleMessage = async function (err, msg) {
       break;
   }
 
-  if (indexOfInitialized === 0) {
-    // OK should still be locked
-    pollForInput();
-  }
+  // A locked key (INITIALIZED at 0) used to have the reader re-armed here so
+  // its once-a-second status kept arriving; the reader never stops now.
 
   if (msg.replace(/\s/g, "").indexOf("UNINITIALIZEDv") >= 0) {
     myOnlyKey.fwUpdateSupport = true;
@@ -1469,7 +1829,8 @@ var handleMessage = async function (err, msg) {
     myOnlyKey.initBootloaderMode();
   } else if (msg.indexOf("UNLOCKED") >= 0) {
     if (myOnlyKey.getLastMessage("sent") === "OKSETPRIV") {
-      pollForInput();
+      // Not an unlock: a status during a key write. It used to be skipped by
+      // re-arming the reader; the reader is continuous, so it is just skipped.
     } else {
       myOnlyKey.setInitialized(true);
       version = msg.split("UNLOCKED").pop();
@@ -1770,8 +2131,9 @@ function submitEccForm(e) {
 
   type += typeModifier;
 
-  myOnlyKey.setPrivateKey(slot, type, key, function (err) {
-    myOnlyKey.listen(handleMessage);
+  myOnlyKey.setPrivateKey(slot, type, key, function (err, msg) {
+    // The answer, which the lib waited for, is what listen(handleMessage) read.
+    handleMessage(err, msg);
     ui.eccForm.reset();
   });
 
@@ -1782,8 +2144,8 @@ function wipeEccKeyForm(e) {
   ui.eccForm.setError("");
 
   var slot = parseInt(ui.eccForm.eccSlot.value || "", 10);
-  myOnlyKey.wipePrivateKey(slot, function (err) {
-    myOnlyKey.listen(handleMessage);
+  myOnlyKey.wipePrivateKey(slot, function (err, msg) {
+    handleMessage(err, msg);
   });
 
   e && e.preventDefault && e.preventDefault();
@@ -1910,7 +2272,7 @@ OnlyKey.prototype.confirmRsaKeySelect = function (keyObj, slot, cb) {
   if (typeof keyObj.s !== "undefined") {
     //ECC
     if (slot < 101) slot += 100;
-    myOnlyKey.setPrivateKey(slot, type, retKey, (err) => {
+    myOnlyKey.setPrivateKey(slot, type, retKey, (err, msg) => {
       // TODO: check for success, then reset
       if (typeof cb === "function") cb(err);
       ui.rsaForm.reset();
@@ -1918,10 +2280,10 @@ OnlyKey.prototype.confirmRsaKeySelect = function (keyObj, slot, cb) {
         backupsigFlag = -1;
         //reset backup form
       }
-      this.listen(handleMessage);
+      handleMessage(err, msg);
     });
   } else {
-    submitRsaKey(slot, type, retKey, (err) => {
+    submitRsaKey(slot, type, retKey, (err, msg) => {
       // TODO: check for success, then reset
       if (typeof cb === "function") cb(err);
       ui.rsaForm.reset();
@@ -1929,24 +2291,18 @@ OnlyKey.prototype.confirmRsaKeySelect = function (keyObj, slot, cb) {
         backupsigFlag = -1;
         //reset backup form
       }
-      this.listen(handleMessage);
+      handleMessage(err, msg);
     });
   }
 };
 
 function submitRsaKey(slot, type, key, callback) {
-  // this function should recursively call itself until all bytes are sent in chunks
   if (!Array.isArray(key)) {
     return callback("Invalid key format.");
   }
-  var maxPacketSize = 57;
-  var finalPacket = key.length - maxPacketSize <= 0;
-
-  var cb = finalPacket
-    ? callback
-    : submitRsaKey.bind(null, slot, type, key.slice(maxPacketSize), callback);
-
-  myOnlyKey.setPrivateKey(slot, type, key.slice(0, maxPacketSize), cb);
+  // The lib's loadKey sends p||q as the same 57-byte OKSETPRIV chunks this
+  // used to send one by one, and then waits for the device's one answer.
+  myOnlyKey.setPrivateKey(slot, type, key, callback);
 }
 
 function saveBackupFile(e) {
@@ -2035,9 +2391,10 @@ function submitRestoreForm(e) {
     reader.onload = (function (theFile) {
       return function (e) {
         //console.info("RESULT:", e.target.result);
-        var contents = e.target && e.target.result && e.target.result.trim();
+        var text = e.target && e.target.result && e.target.result.trim();
+        var contents;
         try {
-          contents = parseBackupData(contents);
+          contents = parseBackupData(text);
         } catch (parseError) {
           return ui.restoreForm.setError(
             "Could not parse backup file.\n\n" + parseError
@@ -2049,12 +2406,19 @@ function submitRestoreForm(e) {
           restoretext.innerHTML =
             "Restoring from backup please wait...<br><br>" +
             "<img src='/images/Pacman-0.8s-200px.gif' height='40' width='40'><br><br>";
-          submitRestoreData(contents, async function (err) {
-            // TODO: check for success, then reset
-            await wait(10000);
-            ui.restoreForm.reset();
-            restoretext.innerHTML = "";
-          });
+          // The lib's restore - see OnlyKey.prototype.submitRestore for the two
+          // deliberate differences (a wrong digest is refused; none is allowed).
+          libOp("OKRESTORE", (device) => device.restore(text, { unverifiable: true })).then(
+            async () => {
+              await wait(10000);
+              ui.restoreForm.reset();
+              restoretext.innerHTML = "";
+            },
+            (err) => {
+              restoretext.innerHTML = "";
+              ui.restoreForm.setError(reportLibError(err));
+            }
+          );
         } else {
           return ui.restoreForm.setError("Incorrect backup data format.");
         }
@@ -2068,6 +2432,12 @@ function submitRestoreForm(e) {
   }
 }
 
+/*
+ * Raw OKRESTORE packets. Only the wizard's no-file "reboot request" uses this
+ * now (submitRestore); its nine zeros become one packet whose header byte and
+ * data are all zero, which is the frame the key has always been sent here.
+ * Real backups go through the lib's restore().
+ */
 function submitRestoreData(restoreData, callback) {
   // this function should recursively call itself until all bytes are sent in chunks
   if (!restoreData.length) {
@@ -2116,14 +2486,10 @@ function submitFirmwareForm(e) {
           if (!myOnlyKey.isBootloader) {
             ui.firmwareForm.setError("Working... Do not remove OnlyKey");
 
-            const temparray = "1234";
-            submitFirmwareData(temparray, function (err) {
-              //First send one message to kick OnlyKey (in config mode) into bootloader
-              //TODO if OnlyKey responds with SUCCESSFULL then continue, if not exit
+            //First send one message to kick OnlyKey (in config mode) into bootloader
+            requestFirmwareLoad(() => {
               ui.firmwareForm.reset();
               ui.firmwareForm.setError("Firmware file sent to OnlyKey");
-
-              myOnlyKey.listen(handleMessage); //OnlyKey will respond with "SUCCESSFULL FW LOAD REQUEST, REBOOTING..." or "ERROR NOT IN CONFIG MODE"
             });
           } else {
             await loadFirmware();
@@ -2141,46 +2507,87 @@ function submitFirmwareForm(e) {
   }
 }
 
+/*
+ * THE FIRMWARE-LOAD REQUEST = the lib's device.requestFirmwareUpdate().
+ *
+ * One OKFWUPDATE carrying "1234" asks a key in config mode to restart into
+ * its bootloader. The three places that start a firmware load (the wizard,
+ * the Firmware panel, the update check) all send it, and all used to follow it
+ * with listen(handleMessage) for "SUCCESSFULL FW LOAD REQUEST, REBOOTING..."
+ * or "Error not in config mode" - so the answer goes to handleMessage here.
+ *
+ * `onRequested` is what each caller meant to run once the request was
+ * accepted. It never ran before: they passed it to submitFirmwareData, which
+ * takes no callback. It runs now, on the key's acceptance only.
+ *
+ * NOT TESTED AGAINST A DEVICE - only against the scripted mock in
+ * test/lib/facade.test.js. Never point that at a real key.
+ */
+function requestFirmwareLoad(onRequested) {
+  return libOp("OKFWUPDATE", (device) => device.requestFirmwareUpdate()).then(
+    (text) => {
+      console.info("Firmware file sent to OnlyKey");
+      if (typeof onRequested === "function") onRequested(text);
+      routeToHandleMessage(text); //OnlyKey will respond with "SUCCESSFULL FW LOAD REQUEST, REBOOTING..." or "ERROR NOT IN CONFIG MODE"
+    },
+    (err) => {
+      const text = reportLibError(err);
+      routeToHandleMessage(/^Error/i.test(text) ? text : `Error ${text}`);
+    }
+  );
+}
+
+/*
+ * THE FIRMWARE ITSELF, to a key in its bootloader = the lib's
+ * device.sendFirmware(). It sends each block as 57-byte OKFWUPDATE packets,
+ * waits for "RECEIVED OKFWUPDATE" after each and for "NEXT BLOCK" /
+ * "SUCCESSFULLY LOADED FW" after each block - what loadFirmware and
+ * submitFirmwareData did with listenForMessageIncludes. The progress text is
+ * the App's, per block as before.
+ *
+ * The lib takes the file's text; the wizard holds the parsed lines
+ * (newFirmware, which parseFirmwareData made by dropping the first and last
+ * line), so the text is put back together from them.
+ *
+ * NOT TESTED AGAINST A DEVICE - see requestFirmwareLoad.
+ */
 async function loadFirmware() {
   const firmwaretext = document.getElementById("firmware-text");
-  const fwlength =
-    onlyKeyConfigWizard.newFirmware && onlyKeyConfigWizard.newFirmware.length;
+  const lines = onlyKeyConfigWizard.newFirmware;
+  const fwlength = lines && lines.length;
 
   if (fwlength) {
     // There is a firmware file to load]
     console.info(`Firmware file parsed into ${fwlength} lines.`); //Each line is a block in the blockchain
 
-    for (let i = 0; i < fwlength; i++) {
-      const line = onlyKeyConfigWizard.newFirmware[i].toString();
-      console.info(`Line ${i}: ${line}`);
-
+    const firmwareFile = okLibPipe.lib.device.firmware;
+    const text = [firmwareFile.BEGIN]
+      .concat(lines.map((line) => line.toString()), [firmwareFile.END])
+      .join("\n");
+    const showProgress = (done, of) => {
       firmwaretext.innerHTML =
         "Loading Firmware<br><br>" +
         "<img src='/images/Pacman-0.8s-200px.gif' height='40' width='40'><br><br>" +
-        Number.parseFloat((i / fwlength) * 100).toFixed(0) +
+        Number.parseFloat((done / of) * 100).toFixed(0) +
         " Percent Complete";
+    };
 
-      try {
-        await submitFirmwareData(line);
-        if (i < fwlength - 1) {
-          console.info(`This signature`, line.slice(0, 64));
-          console.info(`Block info`, line.slice(64, 65));
-          console.info(`Next signature`, line.slice(65, 129));
-          await listenForMessageIncludes("NEXT BLOCK");
-        } else {
-          console.info(`This signature`, line.slice(0, 64));
-          console.info(`Block info`, line.slice(64, 65));
-          await listenForMessageIncludes("SUCCESSFULLY LOADED FW");
-          firmwaretext.innerHTML = "Firmware Load Complete!";
-          ui.firmwareForm.setError("");
-          document.getElementById("firmwareSelectFile").value = "";
-          onlyKeyConfigWizard.newFirmware = null;
-          //
-        }
-      } catch (err) {
-        console.error(`Error submitting firmware data:`, err);
-        return myOnlyKey.setLastMessage("received", err);
-      }
+    showProgress(0, fwlength);
+    try {
+      await libOp("OKFWUPDATE", (device) =>
+        device.sendFirmware(text, {
+          onProgress: ({ block, of, packet, packets }) => {
+            if (packet === packets) showProgress(block, of);
+          },
+        })
+      );
+      firmwaretext.innerHTML = "Firmware Load Complete!";
+      ui.firmwareForm.setError("");
+      document.getElementById("firmwareSelectFile").value = "";
+      onlyKeyConfigWizard.newFirmware = null;
+    } catch (err) {
+      console.error(`Error submitting firmware data:`, err);
+      return myOnlyKey.setLastMessage("received", errorText(err));
     }
 
     // After loading firmware OnlyKey will reboot and version will no longer be "BOOTLOADER"
@@ -2300,18 +2707,9 @@ function checkForNewFW(checkForNewFW, fwUpdateSupport, version) {
                               }
                               console.info(contents);
                               onlyKeyConfigWizard.newFirmware = contents;
-                              const temparray = "1234";
-                              await submitFirmwareData(
-                                temparray,
-                                function (err) {
-                                  //First send one message to kick OnlyKey (in config mode) into bootloader
-                                  console.info(
-                                    "Working... Do not remove OnlyKey"
-                                  );
-                                  console.info("Firmware file sent to OnlyKey");
-                                  myOnlyKey.listen(handleMessage); //OnlyKey will respond with "SUCCESSFULL FW LOAD REQUEST, REBOOTING..." or "ERROR NOT IN CONFIG MODE"
-                                }
-                              );
+                              //First send one message to kick OnlyKey (in config mode) into bootloader
+                              console.info("Working... Do not remove OnlyKey");
+                              await requestFirmwareLoad();
                               resolve();
                             } else {
                               alert(`Firmware Download Failed`);
@@ -2343,92 +2741,13 @@ function checkForNewFW(checkForNewFW, fwUpdateSupport, version) {
   }
 }
 
-function submitFirmwareData(firmwareData) {
-  return new Promise(async function (resolve, reject) {
-    // this function should recursively call itself until all bytes are sent in chunks
-    if (!firmwareData.length) {
-      return reject(`Invalid firmwareData`);
-    }
-
-    const maxPacketSize = 114; // 57 byte pairs
-    const finalPacket = firmwareData.length - maxPacketSize <= 0;
-
-    // packetHeader is hex number of bytes in chunk
-    const packetHeader = finalPacket
-      ? (firmwareData.length / 2).toString(16)
-      : "FF";
-
-    myOnlyKey.firmware(
-      firmwareData.slice(0, maxPacketSize),
-      packetHeader,
-      async function () {
-        await listenForMessageIncludes("RECEIVED OKFWUPDATE").then((result) => {
-          if (finalPacket) {
-            console.info(`FINAL PACKET SENT`);
-            return resolve("submitFirmwareData complete");
-          } else {
-            submitFirmwareData(firmwareData.slice(maxPacketSize)).then(
-              resolve,
-              reject
-            );
-          }
-        }, reject);
-      }
-    );
-  });
-}
-
-async function listenForMessageIncludes(str) {
-  return new Promise(async function listenForMessageIncludesAgain(
-    resolve,
-    reject
-  ) {
-    console.info(`Listening for "${str}"...`);
-    myOnlyKey.listen(async (err, msg) => {
-      if (msg && msg.includes(str)) {
-        console.info(`Match received "${msg}"...`);
-        resolve();
-      } else if (msg && (msg.includes("UNLOCKED") || msg.includes("|"))) {
-        //Chrome app background page sends settime which results in unexpected unlocked response
-        console.info(
-          `While waiting for "${str}", received unexpected message: ${msg}`
-        );
-        await listenForMessageIncludesAgain(resolve, reject);
-      } else {
-        reject(
-          err ||
-            `While waiting for "${str}", received unexpected message: ${msg}`
-        );
-      }
-    });
-  });
-}
-
-async function listenForMessageIncludes2(...args) {
-  return new Promise(async function listenForMessageIncludesAgain2(
-    resolve,
-    reject
-  ) {
-    myOnlyKey.listen(async (err, msg) => {
-      const strings = '"' + args.join('" or "') + '"';
-      console.info(`Listening for ${strings}`);
-      
-      if (msg) {
-        if (args.some(str => msg.includes(str))) {
-          console.info(`Match received "${msg}"`);
-        } else {
-          console.info(`Received ${msg}`);
-          //Chrome app background page sends settime which results in unexpected unlocked response
-          if (!desktopApp) return await listenForMessageIncludesAgain2(resolve, reject);
-        }
-        return resolve();
-      }
-      
-      console.info(`Error received "${err.message || err}"`);
-      return reject(err);
-    });
-  });
-}
+/*
+ * submitFirmwareData, listenForMessageIncludes and listenForMessageIncludes2
+ * lived here: the firmware packet chunker and the "wait for a message that
+ * includes X" readers. The lib's requestFirmwareUpdate / sendFirmware /
+ * setBackupPassphrase do both, so they are gone rather than left as a second
+ * reader (see requestFirmwareLoad and loadFirmware).
+ */
 
 function parseFirmwareData(contents = "") {
   // split by newline
@@ -2451,8 +2770,8 @@ function wipeRsaKey(e) {
   ui.rsaForm.setError("");
 
   var slot = parseInt(ui.rsaForm.rsaSlot.value || "", 10);
-  myOnlyKey.wipePrivateKey(slot, function (err) {
-    myOnlyKey.listen(handleMessage);
+  myOnlyKey.wipePrivateKey(slot, function (err, msg) {
+    handleMessage(err, msg);
   });
 }
 
