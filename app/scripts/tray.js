@@ -40,7 +40,14 @@
   // script until the NW 0.114 move (NW now opens app.html directly - see app.js).
   // "First run" = no autoLaunch key yet; the isEnabled() read below records one
   // on every launch, so this runs once per profile.
-  if (typeof localStorage !== 'undefined' && !localStorage.hasOwnProperty('autoLaunch')) {
+  //
+  // Installed App only. A dev run (npm start, or the test kit) runs nw out of a
+  // node_modules folder, and registering THAT to start at login is never
+  // wanted. The kit starts every run on a fresh profile, so each run re-created
+  // the entry (seen 2026-09-29 on Windows and Linux, pointing at the kit's own
+  // nw SDK). The tray menu can still turn it on for a dev run.
+  if (appName !== 'OnlyKey-dev' &&
+      typeof localStorage !== 'undefined' && !localStorage.hasOwnProperty('autoLaunch')) {
     await autoLaunch.enable().catch(console.error);
   }
 
