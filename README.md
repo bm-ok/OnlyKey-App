@@ -73,7 +73,7 @@ To run tests:
 
     $ npm test
 
-Running tests requires the SDK version of NWJS, which comes with a `chromedriver` that handles automated Selenium tests. To install that version, run `npm install nw --nwjs_build_type=sdk`. Note that to create releases, you should install the non-sdk variant again; otherwise the installer will be unnecessarily large.
+Running tests requires a `chromedriver` from the SDK version of NWJS (the App's own `nw` is the normal flavor, which has none). Either point `OK_CHROMEDRIVER` at an `nwjs-sdk-v<version>-<platform>-<arch>/chromedriver[.exe]` - the test kit's `onlykey-testing/node_modules/nw/` has one - or unpack the SDK flavor beside the App's nw (`node_modules/nw/nwjs-sdk-v0.114.0-<platform>-<arch>/`), where `test/driver.js` finds it. Run the suites with no OnlyKey attached: they script their own device. See `docs/LIB-PORT.md`, "The selenium suites".
 
 ## Cryptography Notice
 

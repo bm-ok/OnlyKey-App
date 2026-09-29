@@ -1,6 +1,6 @@
 # OnlyKey App on node-onlykey-lib
 
-Branch `use-node-onlykey-lib`. The UI is unchanged: `app.html`, `OnlyKeyWizard.js`, the form handlers and every last-message string the UI branches on stay as they were. The device half of `OnlyKeyComm.js` is now a facade over [node-onlykey-lib](https://github.com/bmatusiak/node-onlykey-lib), pinned in `package.json` at `d1b62ea`. The lib is the protocol library the other GUIs share. No frame is built by hand in the App any more: every device operation is a lib method.
+Branch `use-node-onlykey-lib`. The UI is unchanged: `app.html`, `OnlyKeyWizard.js`, the form handlers and every last-message string the UI branches on stay as they were. The device half of `OnlyKeyComm.js` is now a facade over [node-onlykey-lib](https://github.com/bmatusiak/node-onlykey-lib), pinned in `package.json` at `489636b` (the same pin as every other consumer). The lib is the protocol library the other GUIs share. No frame is built by hand in the App any more: every device operation is a lib method.
 
 ## What changed
 
@@ -128,11 +128,22 @@ The master branch (6.0.0 before the port) hangs the same way on 0.114, so the ha
 
 `npm run test:lib` passes (52 tests). It covers the pipe, the lib stack against a scripted key, and the real page scripts in a vm with a fake DOM. The App also starts on NW 0.114 and reads the emulated key on Windows (okvhid) and Linux (USB gadget); the kit's 04-app section passes 29/0/0 on the VM (2026-09-29). The following have **not** been run:
 
-- **The selenium suites.** `test/driver.js` looks for chromedriver at `node_modules/nw/nwjs/`. That path is gone in 0.114, and chromedriver ships only with the `-sdk` flavor.
 - **Any real key.** Nothing has been tested against hardware: timings, locked broadcasts, the VM case the double OKSETTIME was for, the DUO config-mode path (`INITIALIZED-D` → `setTime` loop, now coalesced), and how the bootloader answers the lib's OKCONNECT (time plus a 32-byte transit key; the old OKSETTIME carried only the time).
 - **Firmware update has only been run against the scripted mock. Do not test it on a key you cannot re-image.**
-- **`test/configure-slot-test.js` (selenium) will need rework.** It injects replies before the requests they answer, relying on Chrome's queue to feed whichever one-shot reader asked next. It also indexes `_sent` on the assumption that slot writes are not acknowledged. The mock hooks themselves still work.
+- **~~`test/configure-slot-test.js` (selenium) will need rework.~~ Done (797b70f): see "The selenium suites" below.** It injected replies before the requests they answer, relying on Chrome's queue to feed whichever one-shot reader asked next. It also indexed `_sent` on the assumption that slot writes are not acknowledged. The mock hooks themselves still work.
 - **The Chrome-app build (`--env=chrome`)** has no `require` and cannot load the lib.
+
+## The selenium suites
+
+`npm test` (upstream's UI tests: `test/startup-test.js`, `test/configure-slot-test.js`) passes **11/11 on Windows and Linux with no OnlyKey attached** (2026-09-29). As-is they could not start; upstream master under the same conditions passes 1 of 10. What changed (7ad3560, e305401, 797b70f):
+
+- `test/driver.js`: selenium-webdriver 4's `setChromeService` (4.x removed `chrome.setDefaultService`), and chromedriver from `OK_CHROMEDRIVER` or an `nwjs-sdk-*` folder beside the App's nw - only the SDK flavor has one, and since nw 0.9x each flavor unpacks to its own folder.
+- Every step `await`ed: selenium 4 has no control flow, so un-awaited `click`/`sendKeys`/`getText` fired at once.
+- `configure-slot-test` binds the mock connection to `test/lib/helpers/fakeOnlyKey.js`, which answers each request, instead of a script of replies sent before the requests (which the lib's single reader and OKCONNECT handshake cannot consume).
+- Two stale expectations corrected: the title is `OnlyKey App`, and no Return follows a password (the NEXTKEY3 FIXME; the kit's 04-app/11 showed it against real firmware before the port).
+- `npm test` = `mocha --timeout 20000 "test/*-test.js"` (an NW reload takes ~2.5 s; `test/serial.js` is a serial-monitor utility, not a test). `build` is `gulp build`, so it runs under cmd.exe too.
+
+Run them with no key attached (Linux: `pm2 stop` the emulator so the gadget is down; Windows: unplug the okvhid devices) - the suites script their own device.
 
 ## Risks
 
