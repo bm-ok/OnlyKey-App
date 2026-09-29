@@ -14,18 +14,22 @@ chai.use(chaiAsPromised);
 
 describe('OnlyKey Configuration', function() {
 
-    it('should start disconnected', function() {
-        driver.navigate().refresh();
-        driver.wait(until.titleIs('OnlyKey Configuration Wizard'));
+    // Every step is awaited: selenium-webdriver 4 dropped the control flow that
+    // once ran un-awaited calls in order. app.html's title is "OnlyKey App"; the
+    // old 'OnlyKey Configuration Wizard' wait was never awaited, so it never
+    // checked anything.
+    it('should start disconnected', async function() {
+        await driver.navigate().refresh();
+        await driver.wait(until.titleIs('OnlyKey App'), 15000);
 
-        const disconnected = driver.findElement(By.id('disconnected-dialog'));
+        const disconnected = await driver.findElement(By.id('disconnected-dialog'));
         return expect(disconnected.getAttribute('open')).to.eventually.equal('true');
     });
 
-    it('should not show "working..." dialog', function() {
-        driver.wait(until.titleIs('OnlyKey Configuration Wizard'));
+    it('should not show "working..." dialog', async function() {
+        await driver.wait(until.titleIs('OnlyKey App'), 15000);
 
-        const working = driver.findElement(By.id('working-dialog'));
+        const working = await driver.findElement(By.id('working-dialog'));
         return expect(working.getAttribute('open')).to.eventually.equal(null);
     });
 });
