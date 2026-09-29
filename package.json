@@ -6,7 +6,7 @@
   "description": "Setup and configure OnlyKey",
   "main": "app.html",
   "scripts": {
-    "build": "./node_modules/.bin/gulp build",
+    "build": "gulp build",
     "build_win": ".\\node_modules\\.bin\\gulp build",
     "prerelease": "rm -rf ./node_modules/* && npm install --production && rm -rf ./release_node_modules && mkdir release_node_modules && cd release_node_modules && mkdir node_modules && cd .. && cp -R ./node_modules/* ./release_node_modules/node_modules && npm install && npm run build -- --env=production",
     "prerelease_win": "rm -rf ./node_modules/* && npm install --production && rm -rf ./release_node_modules && mkdir release_node_modules && cd release_node_modules && mkdir node_modules && cd .. && cp -R ./node_modules/* ./release_node_modules/node_modules && npm install && npm run build_win -- --env=production",
@@ -14,7 +14,7 @@
     "release_win": ".\\node_modules\\.bin\\gulp release --env=production",
     "start": "node ./tasks/start",
     "pretest": "npm run-script build",
-    "test": "mocha",
+    "test": "mocha \"test/*-test.js\"",
     "test:lib": "mocha --timeout 30000 test/lib",
     "testgulp": ".\\node_modules\\.bin\\gulp -v",
     "prechrome": "./node_modules/.bin/gulp build --env=chrome",
