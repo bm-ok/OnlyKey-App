@@ -23,7 +23,7 @@
   "dependencies": {
     "auto-launch": "^5.0.5",
     "js-sha256": "^0.9.0",
-    "node-onlykey-lib": "github:bmatusiak/node-onlykey-lib#90ec3b6ba93dde556adc1265be03b8a6bf87a0ea",
+    "node-onlykey-lib": "github:bmatusiak/node-onlykey-lib#e5c61ee861817dd0bbcaee01b955e1071ab7361d",
     "nw": "0.114.0",
     "nw-autoupdater": "^1.1.11",
     "request": "^2.88.2",
