@@ -773,8 +773,11 @@ OnlyKey.prototype.wipeSlot = function (slotArg, field, callback) {
   const name = field ? okLibPipe && okLibPipe.SLOT_FIELD[field] : null;
   if (field && !name) return done(`wipeSlot: unknown field ${field}`);
 
+  /* The lib (0.3.0) resolves {slot, response, responses} - every reply the
+   * firmware sends; `response` is the first, the string this callback has
+   * always been given. */
   return libOp("OKWIPESLOT", (device) => device.wipeSlot(slot, name)).then(
-    (text) => done(null, text),
+    (r) => done(null, r.response),
     (err) => done(reportLibError(err))
   );
 };
